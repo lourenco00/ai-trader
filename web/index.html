@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Trader Valley</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f5c542' stroke='%23a8741a' stroke-width='2'/></svg>" />
+  </head>
+  <body>
+    <canvas id="world" role="img" aria-label="Pixel-art village where AI agents research strategies and paper-trade. Use the building menu or agent roster for a text view."></canvas>
+    <header id="hud"></header>
+    <nav id="buildings" aria-label="Buildings"></nav>
+    <aside id="roster" aria-label="Agent roster"></aside>
+    <section id="questlog" aria-label="Recent events"></section>
+    <div id="tooltip" role="tooltip" hidden></div>
+    <div id="overlay" hidden>
+      <div id="panel" class="box" role="dialog" aria-modal="true" aria-labelledby="panel-title"></div>
+    </div>
+    <div id="toasts" aria-live="polite"></div>
+    <div id="connecting">Connecting to the valley...</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
