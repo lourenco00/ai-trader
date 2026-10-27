@@ -101,7 +101,7 @@ function biasCell(b: number): string {
 function markets(s: WorldSnapshot): PanelView {
   const mk = s.markets
     .map(
-      (m, i) => `<tr><td><b>${esc(m.symbol)}</b> <span class="tag ${m.asset}">${m.asset}</span>${m.asset === 'stock' && !m.marketOpen ? ' <span class="muted">(closed)</span>' : ''}</td>
+      (m, i) => `<tr><td><b>${esc(m.symbol)}</b> <span class="tag ${m.asset}">${m.asset}</span>${m.tier === 'explored' ? ` <span class="tag explored" title="${esc(m.exploreNote ?? '')}">explored</span>` : ''}${m.asset === 'stock' && !m.marketOpen ? ' <span class="muted">(closed)</span>' : ''}</td>
         <td>${price(m.price)}</td><td class="${cls(m.change24h)}">${pct(m.change24h)}</td>
         <td>${esc(m.regime)}</td><td>${(m.volatility * 100).toFixed(0)}%</td><td>${biasCell(m.newsBias)}</td><td><canvas class="spark" data-spark="${i}" aria-label="${esc(m.symbol)} 24h price"></canvas></td></tr>`,
     )

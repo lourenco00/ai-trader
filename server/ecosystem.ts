@@ -10,6 +10,7 @@ import type {
 } from '../shared/types';
 import type { Agent, AgentSave } from './agents/base';
 import { Commander } from './agents/commander';
+import { Explorer } from './agents/explorer';
 import type { Dataset, EcoContext, FundView } from './agents/context';
 import { NewsDesk } from './agents/newsDesk';
 import { Researcher } from './agents/researcher';
@@ -24,6 +25,7 @@ import { achievementList, ACHIEVEMENTS, graduation } from './gamification';
 import { LlmClient } from './llm/client';
 import { freshCost, LlmBudget, type LlmCostState } from './llm/budget';
 import { MarketFeed } from './market/feed';
+import { Universe, type UniverseSave } from './market/universe';
 import { NEWS_ANCHORS, RESEARCHERS, STAFF, TRADERS } from './roster';
 import { SignalBoard, type Signal } from './signals/board';
 import { IndicatorCache } from './strategy/indicators';
@@ -71,6 +73,7 @@ interface SaveFile {
   lastEdition: { equity: number; trades: number; fees: number };
   llmCost: LlmCostState;
   llmAttribution: LlmAttribution;
+  universe?: UniverseSave;
 }
 
 const MAX_NEWS = 300;
@@ -100,6 +103,7 @@ function freshFund(capital: number): FundState {
 
 export class Ecosystem implements EcoContext {
   readonly feed: MarketFeed;
+  readonly universe: Universe;
   readonly broker: Broker;
   readonly vault: StrategyVault;
   readonly fund: FundView;
@@ -117,12 +121,15 @@ export class Ecosystem implements EcoContext {
   private riskOfficer!: RiskOfficer;
   private commander!: Commander;
   private scout!: Scout;
+  private explorer!: Explorer;
   private reporter!: Reporter;
   private treasurer!: Treasurer;
   private strategist!: Strategist;
   private agents: Agent[] = [];
   private llmPausedReason: string | null = null;
   private stockMarketOpen = true;
+  private capital: number;
+  private lastBrokerCheck = 0;
 
   private trades: TradeDTO[] = [];
   private newsItems: NewsItem[] = [];
@@ -141,11 +148,13 @@ export class Ecosystem implements EcoContext {
   private started = false;
 
   constructor(readonly cfg: Config) {
-    if (cfg.execution === 'alpaca' || cfg.provider === 'alpaca') this.alpaca = new AlpacaClient(cfg);
+    if (cfg.execution === 'alpaca' || cfg.provider === 'alpaca' || cfg.universe.scanStocks) this.alpaca = new AlpacaClient(cfg);
+    this.universe = new Universe(cfg);
     this.feed = new MarketFeed(cfg, this.alpaca);
-    this.broker = cfg.execution === 'alpaca' && this.alpaca ? new AlpacaBroker(this.alpaca) : new PaperBroker(cfg.feeRate, cfg.slippage);
+    this.broker = cfg.execution === 'alpaca' && this.alpaca ? new AlpacaBroker(this.alpaca) : new PaperBroker(cfg.feeRate, cfg.slippage, (s) => this.universe.slippage(s));
     this.vault = new StrategyVault(cfg.research.vaultCapacity);
-    this.fundState = freshFund(cfg.startingCapital);
+    this.capital = cfg.startingCapital;
+    this.fundState = freshFund(this.capital);
     this.llmCost = freshCost();
     this.llmBudget = new LlmBudget(this.llmCost, cfg.llm.dailyBudgetUsd);
     this.llm = new LlmClient(cfg, this.llmBudget);
@@ -200,7 +209,10 @@ export class Ecosystem implements EcoContext {
       log.info(`restored season from ${new Date(saved.savedAt).toISOString()} (${this.vault.all().length} strategies)`);
     }
 
+    if (!saved && this.cfg.execution === 'alpaca' && this.alpaca) await this.fundFromAlpaca();
+    const savedExplored = this.universe.restoreFacts(saved?.universe);
     await this.feed.start();
+    await this.rehydrateUniverse(savedExplored);
     this.createAgents();
     if (saved?.agents) {
       const byId = new Map(saved.agents.map((a) => [a.id, a]));
@@ -243,6 +255,8 @@ export class Ecosystem implements EcoContext {
     });
     this.commander = new Commander(this, STAFF.commander.id, STAFF.commander.name, STAFF.commander.look, this.traders, this.fundState);
     this.scout = new Scout(this, STAFF.scout.id, STAFF.scout.name, STAFF.scout.look);
+    this.explorer = new Explorer(this, STAFF.explorer.id, STAFF.explorer.name, STAFF.explorer.look, this.alpaca);
+    this.universe.onChange((c) => this.onUniverseChange(c));
     this.reporter = new Reporter(this, STAFF.reporter.id, STAFF.reporter.name, STAFF.reporter.look);
     this.treasurer = new Treasurer(this, STAFF.treasurer.id, STAFF.treasurer.name, STAFF.treasurer.look);
     this.strategist = new Strategist(this, STAFF.strategist.id, STAFF.strategist.name, STAFF.strategist.look);
@@ -255,6 +269,7 @@ export class Ecosystem implements EcoContext {
       this.commander,
       this.riskOfficer,
       this.scout,
+      this.explorer,
       this.reporter,
       this.treasurer,
       this.strategist,
@@ -262,6 +277,60 @@ export class Ecosystem implements EcoContext {
       ...this.researchers,
       ...this.traders,
     ];
+  }
+
+  /**
+   * With Alpaca as the venue the money comes from the Alpaca paper account: the fund starts
+   * with the account's cash, capped by STARTING_CAPITAL so the agents use a slice of it.
+   */
+  private async fundFromAlpaca(): Promise<void> {
+    const acct = await this.alpaca!.account();
+    if (acct.status !== 'ACTIVE') throw new Error(`Alpaca account is ${acct.status}, not ACTIVE`);
+    this.capital = Math.floor(Math.min(acct.cash, this.cfg.startingCapital));
+    if (!(this.capital >= 100)) throw new Error(`Alpaca paper account has only $${acct.cash.toFixed(2)} cash`);
+    this.fundState = freshFund(this.capital);
+    const held = await this.alpaca!.positions().catch(() => []);
+    log.info(`funded from Alpaca paper account: $${this.capital} of $${acct.cash.toFixed(2)} cash${held.length ? `; account already holds ${held.map((p) => p.symbol).join(', ')} (not managed by the agents)` : ''}`);
+  }
+
+  /** Every few minutes, check that what the ledger thinks it holds is what Alpaca holds. */
+  private async checkBroker(): Promise<void> {
+    if (this.cfg.execution !== 'alpaca' || !this.alpaca || Date.now() - this.lastBrokerCheck < 5 * 60_000) return;
+    this.lastBrokerCheck = Date.now();
+    try {
+      const real = new Map((await this.alpaca.positions()).map((p) => [p.symbol, p.marketValue]));
+      for (const t of this.traders) {
+        const p = t.wallet.position;
+        if (p && !real.has(p.symbol)) this.news('risk', `MISMATCH: ${t.name} thinks it holds ${p.symbol} but Alpaca has no such position`, { agentId: t.id, good: false });
+      }
+    } catch (err) {
+      log.debug('broker check failed', err);
+    }
+  }
+
+  /** Bring back explored symbols from the last run. Any whose data no longer loads are dropped. */
+  private async rehydrateUniverse(entries: ReturnType<Universe['restoreFacts']>): Promise<void> {
+    for (const e of entries) {
+      const why = await this.feed.addSymbol(e.symbol, e.asset, this.cfg.universe.minBars);
+      if (why) {
+        log.warn(`explored symbol ${e.symbol} not restored: ${why}`);
+        continue;
+      }
+      this.universe.add(e);
+    }
+  }
+
+  private onUniverseChange(c: { added?: string; removed?: string }): void {
+    if (c.added) {
+      this.scout.watch(c.added);
+      return;
+    }
+    if (!c.removed) return;
+    const symbol = c.removed;
+    this.feed.removeSymbol(symbol);
+    this.datasets.delete(symbol);
+    this.scout.forget(symbol);
+    for (const s of this.vault.byStatus('vault')) if (s.symbol === symbol) this.vault.remove(s.id);
   }
 
   /** Make restored state consistent with the current config. */
@@ -273,6 +342,16 @@ export class Ecosystem implements EcoContext {
         t.wallet.position = null;
       }
     }
+    // A strategy whose market could not be restored (e.g. an explored coin that was delisted) has nothing to trade.
+    for (const t of this.traders) {
+      const s = t.strategy;
+      if (s && !this.cfg.symbols.includes(s.symbol)) {
+        log.warn(`${t.name}'s strategy ${s.name} lost its market ${s.symbol}; retiring it`);
+        this.vault.retire(s.id, `${s.symbol} is no longer on the map`, 'Its market vanished.');
+        t.unassign();
+      }
+    }
+    for (const s of this.vault.byStatus('vault')) if (!this.cfg.symbols.includes(s.symbol)) this.vault.remove(s.id);
     const held = new Set(this.traders.map((t) => t.strategy?.id).filter(Boolean));
     for (const s of this.vault.byStatus('active')) {
       if (!held.has(s.id)) {
@@ -322,6 +401,7 @@ export class Ecosystem implements EcoContext {
       this.enforceLlmEarnings();
       await this.commander.tick();
       this.strategist.tick();
+      this.explorer.tick();
       await Promise.all(this.analysts.map((a) => a.tick()));
     } catch (err) {
       log.error('fast loop failed', err);
@@ -372,6 +452,7 @@ export class Ecosystem implements EcoContext {
       this.riskOfficer.minuteTick();
       this.checkPeriodicAchievements(eq);
       if (this.cfg.hasStocks && this.alpaca) void this.refreshStockClock();
+      void this.checkBroker();
       if (now - this.reporter.lastEditionAt > 6 * 3_600_000) this.publishGazette();
     } catch (err) {
       log.error('minute loop failed', err);
@@ -386,7 +467,7 @@ export class Ecosystem implements EcoContext {
       this.stockMarketOpen = clock.isOpen;
       if (was !== clock.isOpen) {
         this.news('market', `US stock market ${clock.isOpen ? 'opened' : 'closed'}. Stock traders ${clock.isOpen ? 'back on the floor' : 'heading home'}.`);
-        if (!clock.isOpen) {
+        if (!clock.isOpen && this.cfg.execution !== 'alpaca') {
           // Flatten stock positions overnight so nothing drifts unmanaged while closed.
           for (const t of this.traders) {
             if (t.wallet.position && this.cfg.assetClass(t.wallet.position.symbol) === 'stock') void t.flatten('market closed');
@@ -652,6 +733,7 @@ export class Ecosystem implements EcoContext {
       serverTime: Date.now(),
       seasonStartedAt: this.seasonStartedAt,
       mode: 'paper',
+      execution: this.cfg.execution === 'alpaca' ? 'alpaca' : 'local',
       provider: this.feed.provider.name,
       timeframe: this.cfg.timeframe,
       llmEnabled: this.cfg.llm.enabled,
@@ -760,7 +842,7 @@ export class Ecosystem implements EcoContext {
     this.vault.clear();
     this.datasets.clear();
     this.board.restore([]);
-    const fresh = freshFund(this.cfg.startingCapital);
+    const fresh = freshFund(this.capital);
     Object.assign(this.fundState, fresh);
     this.trades = [];
     this.newsItems = [];
@@ -775,7 +857,8 @@ export class Ecosystem implements EcoContext {
     if (this.riskOfficer.halted) this.riskOfficer.resume();
     this.riskOfficer.cooldownUntil = null;
     for (const r of this.researchers) r.resetResearch();
-    this.news('system', `A new season begins with $${this.cfg.startingCapital.toFixed(2)} of paper money${backup ? `. Old season saved to ${path.basename(backup)}` : ''}`, { good: true });
+    this.universe.reset();
+    this.news('system', `A new season begins with $${this.capital.toFixed(2)} of paper money${backup ? `. Old season saved to ${path.basename(backup)}` : ''}`, { good: true });
     await this.save();
     return backup;
   }
@@ -800,6 +883,7 @@ export class Ecosystem implements EcoContext {
         lastEdition: this.lastEdition,
         llmCost: this.llmBudget.snapshot(),
         llmAttribution: this.llmAttribution,
+        universe: this.universe.save(),
       };
       await writeJsonAtomic(this.stateFile, data);
     } catch (err) {

@@ -249,6 +249,8 @@ export class Trader extends Agent {
     if (!p) return;
     const price = this.ctx.feed.price(p.symbol);
     if (price === undefined) return;
+    // A stock order sent after the bell would sit until the next open; stops resume then.
+    if (!this.ctx.marketOpen(p.symbol)) return;
     const long = p.side === 'long';
     if (long ? price <= p.stop : price >= p.stop) {
       await this.close(price, p.stop === p.entryPrice ? 'breakeven stop' : 'stop loss');
@@ -272,7 +274,7 @@ export class Trader extends Agent {
     const p = this.wallet.position;
     if (!p) return;
     const long = p.side === 'long';
-    const fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price });
+    const fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price, closing: true });
     const gross = (fill.price - p.entryPrice) * p.qty * (long ? 1 : -1);
     this.wallet.cash += gross - fill.fee;
     this.wallet.position = null;

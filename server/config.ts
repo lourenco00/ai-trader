@@ -62,9 +62,11 @@ function parseSymbols(raw: string): SymbolSpec[] {
 
 const symbolSpecs = parseSymbols(env.SYMBOLS?.trim() || 'BTC,ETH,SOL');
 if (symbolSpecs.length === 0) throw new Error('config: SYMBOLS must contain at least one symbol like BTC or $NVDA');
+// Both lists are mutable on purpose: the Explorer adds and drops symbols at runtime and
+// every other module reads them through `config`, so they must be edited in place.
 const symbols = symbolSpecs.map((s) => s.symbol);
 const assetOf = new Map(symbolSpecs.map((s) => [s.symbol, s.asset]));
-const hasStocks = symbolSpecs.some((s) => s.asset === 'stock');
+const coreSymbols = new Set(symbols);
 
 const llmProvider = env.LLM_PROVIDER?.trim().toLowerCase() || '';
 const llmKey = env.LLM_API_KEY?.trim() || '';
@@ -78,8 +80,12 @@ const llmOutPrice = num('LLM_PRICE_OUT', llmProvider === 'anthropic' ? 4 : 0.6, 
 const alpacaKey = env.ALPACA_KEY_ID?.trim() || '';
 const alpacaSecret = env.ALPACA_SECRET?.trim() || '';
 const alpacaPaper = bool('ALPACA_PAPER', true);
+const hasAlpacaKeys = alpacaKey !== '' && alpacaSecret !== '';
 const execMode = (env.EXECUTION?.trim().toLowerCase() || 'paper') as 'paper' | 'alpaca';
 if (!['paper', 'alpaca'].includes(execMode)) throw new Error('config: EXECUTION must be paper or alpaca');
+if (execMode === 'alpaca' && !alpacaPaper) {
+  throw new Error('config: EXECUTION=alpaca requires ALPACA_PAPER=true. Live trading is deliberately disabled in this build.');
+}
 if (execMode === 'alpaca' && (!alpacaKey || !alpacaSecret)) {
   throw new Error('config: EXECUTION=alpaca needs ALPACA_KEY_ID and ALPACA_SECRET');
 }
@@ -92,8 +98,26 @@ export const config = {
   startingCapital: num('STARTING_CAPITAL', 10_000, 100, 1e9),
   symbols,
   symbolSpecs,
-  hasStocks,
+  /** Symbols from SYMBOLS in .env. The Explorer never removes these. */
+  isCore: (symbol: string): boolean => coreSymbols.has(symbol),
+  get hasStocks(): boolean {
+    return symbolSpecs.some((s) => s.asset === 'stock');
+  },
   assetClass: (symbol: string): AssetClass => assetOf.get(symbol) ?? 'crypto',
+  registerSymbol(spec: SymbolSpec): void {
+    if (assetOf.has(spec.symbol)) return;
+    assetOf.set(spec.symbol, spec.asset);
+    symbols.push(spec.symbol);
+    symbolSpecs.push(spec);
+  },
+  unregisterSymbol(symbol: string): void {
+    if (coreSymbols.has(symbol)) return;
+    assetOf.delete(symbol);
+    const i = symbols.indexOf(symbol);
+    if (i >= 0) symbols.splice(i, 1);
+    const j = symbolSpecs.findIndex((s) => s.symbol === symbol);
+    if (j >= 0) symbolSpecs.splice(j, 1);
+  },
   timeframe,
   timeframeMs,
   barsPerYear: (365 * 24 * 60 * 60_000) / timeframeMs,
@@ -102,6 +126,8 @@ export const config = {
   pollMs: num('POLL_MS', 10_000, 3000, 120_000),
 
   feeRate: num('FEE_RATE', 0.001, 0, 0.01),
+  /** Alpaca charges crypto takers about 0.25% (taken in kind) and US stocks nothing. */
+  alpacaCryptoFee: 0.0025,
   slippage: num('SLIPPAGE_BPS', 3, 0, 100) / 10_000,
 
   researchers: Math.round(num('RESEARCHERS', 4, 1, 8)),
@@ -122,6 +148,12 @@ export const config = {
     dailyLossLimit: 0.05,
     maxGrossExposure: 1.0,
     maxSymbolExposure: 0.5,
+    /** Cap per explored (non-core) coin or stock: thin books and gappy prices. */
+    maxExploredSymbolExposure: 0.15,
+    /** Cap across all explored symbols together. */
+    maxExploredExposure: 0.5,
+    /** A single order may not exceed this share of the symbol's 24h dollar volume. */
+    maxVolumeParticipation: 0.005,
     maxNetLong: 1.0,
     maxNetShort: 1.0,
     staleDataMs: 3 * 60_000,
@@ -166,6 +198,33 @@ export const config = {
     // If LLM-attributed net P&L stays below this over the rolling window, the LLM
     // sleeps until a new season or manual resume. It must earn its keep.
     earnWindowDays: num('LLM_EARN_WINDOW_DAYS', 7, 1, 90),
+  },
+
+  /**
+   * The Explorer scans beyond SYMBOLS for lower-cap crypto (Binance public tickers)
+   * and US stocks (Alpaca screener) and adds the most interesting ones to the
+   * universe the researchers work on.
+   */
+  universe: {
+    scanEnabled: bool('SCAN_ENABLED', true),
+    scanEveryMs: num('SCAN_INTERVAL_MIN', 30, 5, 1440) * 60_000,
+    maxExplored: Math.round(num('SCAN_MAX_EXPLORED', 10, 0, 40)),
+    addPerScan: Math.round(num('SCAN_ADD_PER_SCAN', 3, 1, 10)),
+    // 24h quote volume band for crypto, in USD. The floor keeps out coins nobody can
+    // trade; the ceiling keeps the scan on lower-cap names instead of the usual majors.
+    minVolumeUsd: num('SCAN_MIN_VOLUME_USD', 2_000_000, 100_000, 1e12),
+    maxVolumeUsd: num('SCAN_MAX_VOLUME_USD', 150_000_000, 1_000_000, 1e13),
+    // Market-cap filter, from CoinGecko's free listing. Skips the well-known top of the table
+    // and the dust at the bottom. If CoinGecko is unreachable the scan falls back to volume alone.
+    skipTopRank: Math.round(num('SCAN_SKIP_TOP_RANK', 50, 0, 500)),
+    minMarketCapUsd: num('SCAN_MIN_MCAP_USD', 10_000_000, 0, 1e12),
+    scanStocks: bool('SCAN_STOCKS', hasAlpacaKeys) && hasAlpacaKeys,
+    stockMinPrice: num('SCAN_STOCK_MIN_PRICE', 1, 0.1, 1000),
+    stockMaxPrice: num('SCAN_STOCK_MAX_PRICE', 60, 1, 100_000),
+    /** Explored symbols are dropped after this many research epochs if nothing was promoted on them. */
+    evictAfterEpochs: Math.round(num('SCAN_EVICT_AFTER_EPOCHS', 4, 1, 100)),
+    /** Minimum 15m history needed before researchers can use a symbol. */
+    minBars: 1000,
   },
 
   news: {

@@ -10,7 +10,8 @@ export type AgentRole =
   | 'scout'
   | 'reporter'
   | 'treasurer'
-  | 'analyst';
+  | 'analyst'
+  | 'explorer';
 
 export type BuildingId =
   | 'command'
@@ -189,6 +190,11 @@ export interface MarketDTO {
   spark: number[];
   marketOpen: boolean;
   newsBias: number; // -1..1 from the signal board
+  /** core = from SYMBOLS; explored = found by the Explorer. */
+  tier: 'core' | 'explored';
+  /** Why the Explorer picked it (explored only). */
+  exploreNote: string | null;
+  volumeUsd: number | null;
 }
 
 export interface SignalDTO {
@@ -317,6 +323,8 @@ export interface WorldSnapshot {
   serverTime: number;
   seasonStartedAt: number;
   mode: 'paper';
+  /** Where orders are filled: a local simulator, or the Alpaca paper account. */
+  execution: 'local' | 'alpaca';
   provider: string;
   timeframe: string;
   llmEnabled: boolean;

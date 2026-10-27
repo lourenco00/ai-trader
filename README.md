@@ -44,6 +44,17 @@ Click buildings or villagers, drag to pan, scroll or `+`/`-` to zoom, arrow keys
 
 **Risk.** Sarge blocks entries that would push gross exposure over 100% of equity (no leverage) or put more than 50% in one coin, pauses entries for the rest of the UTC day after a 5% daily loss, blocks entries when market data is stale, and pulls the kill switch (flatten everything, stop trading) at a 20% fund drawdown. You can pull it manually in the War Room.
 
+## Exploring beyond the usual coins
+
+The **Explorer** (Magellan) scans every 30 minutes for markets nobody put in `SYMBOLS`:
+
+- **Crypto:** every USDT pair on Binance, filtered to a 24h volume band ($2M-$150M), CoinGecko market-cap rank below the top 50 and at least $10M cap. It then reads a week of hourly candles and scores volume surge, 7-day move and volatility.
+- **Stocks** (needs Alpaca keys): the screener's most active names between $1 and $60 with real dollar volume.
+
+Up to 10 explored markets are kept (`SCAN_MAX_EXPLORED`). The researchers always work on the least recently researched market, so new arrivals get attention first, and a market that yields nothing after a few epochs is dropped to make room.
+
+Small caps are treated more harshly than BTC, on purpose: slippage rises as 24h volume falls (3 bps up to 43 bps), strategies on explored markets are long-only, one order can use at most 0.5% of the market's daily volume, and Sarge caps each explored market at 15% of the fund and all of them together at 50%. Run `npm run report` any time for a plain verdict on the season.
+
 ## Before real money
 
 The Command Center tracks a Real Money License: 30+ days on real data, 100+ trades, positive net return, max drawdown under 15%, hourly Sharpe of 1.0+, and 3+ strategies profitable after 10 live trades. Treat a full license as evidence, not a guarantee. Paper fills ignore order-book depth, partial fills, funding rates, exchange downtime and withdrawal risk, and many strategies that look good for a month stop working.

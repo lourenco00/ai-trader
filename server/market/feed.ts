@@ -82,6 +82,58 @@ export class MarketFeed {
     if (this.timer) clearTimeout(this.timer);
   }
 
+  /** The provider that serves crypto; the Explorer scans through it. */
+  cryptoProvider(): MarketDataProvider | null {
+    for (const s of this.cfg.symbols) {
+      const p = this.providerOf.get(s);
+      if (p && this.cfg.assetClass(s) === 'crypto') return p;
+    }
+    return null;
+  }
+
+  /**
+   * Loads history for a symbol that is not in the startup list and starts polling it.
+   * Returns a reason string on failure, null on success. Nothing is left behind on failure.
+   */
+  async addSymbol(symbol: string, asset: 'crypto' | 'stock', minBars: number): Promise<string | null> {
+    if (this.providerOf.has(symbol)) return null;
+    let p: MarketDataProvider | null;
+    if (asset === 'crypto') {
+      p = this.cryptoProvider() ?? this.provider ?? null;
+      if (!p || p.name === 'sim') return 'no real crypto data provider';
+    } else {
+      if (!this.alpaca) return 'no Alpaca keys for stocks';
+      p = new AlpacaProvider(this.alpaca);
+    }
+    // The Alpaca client routes by asset class, so the symbol must be known to the config first.
+    const wasKnown = this.cfg.symbols.includes(symbol);
+    if (!wasKnown) this.cfg.registerSymbol({ symbol, asset });
+    try {
+      const now = Date.now();
+      const raw = await p.fetchHistory(symbol, this.cfg.timeframeMs, this.cfg.historyBars + 1);
+      const closed = raw.filter((c) => c.t + this.cfg.timeframeMs <= now);
+      if (closed.length < minBars) return `only ${closed.length} bars of history`;
+      const last = closed[closed.length - 1];
+      if (now - last.t > 12 * 3_600_000 && asset === 'crypto') return 'history is stale';
+      if (!(raw[raw.length - 1].c > 0)) return 'no price';
+      this.candles.set(symbol, closed);
+      this.prices.set(symbol, raw[raw.length - 1].c);
+      this.providerOf.set(symbol, p);
+      log.info(`added ${symbol} (${asset}) via ${p.name}: ${closed.length} bars`);
+      return null;
+    } catch (err) {
+      return String((err as Error).message ?? err).slice(0, 120);
+    } finally {
+      if (!this.providerOf.has(symbol) && !wasKnown) this.cfg.unregisterSymbol(symbol);
+    }
+  }
+
+  removeSymbol(symbol: string): void {
+    this.providerOf.delete(symbol);
+    this.candles.delete(symbol);
+    this.prices.delete(symbol);
+  }
+
   private cryptoProviders(): MarketDataProvider[] {
     const sim = new SimulatedProvider(this.cfg.timeframeMs);
     const alp = this.alpaca ? [new AlpacaProvider(this.alpaca)] : [];

@@ -14,6 +14,7 @@
     "build": "vite build",
     "start": "vite build && tsx server/index.ts",
     "serve": "tsx server/index.ts",
+    "report": "tsx server/report.ts",
     "typecheck": "tsc -p tsconfig.server.json && tsc -p web/tsconfig.json"
   },
   "dependencies": {

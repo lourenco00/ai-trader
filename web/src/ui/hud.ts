@@ -3,7 +3,7 @@ import { BUILDINGS } from '../world/map';
 import { character } from '../world/sprites';
 import { ago, cls, esc, money, pct } from './format';
 
-const ROLE_ORDER: Record<string, number> = { commander: 0, risk: 1, treasurer: 2, scout: 3, reporter: 4, analyst: 5, strategist: 6, researcher: 7, trader: 8 };
+const ROLE_ORDER: Record<string, number> = { commander: 0, risk: 1, treasurer: 2, scout: 3, explorer: 3, reporter: 4, analyst: 5, strategist: 6, researcher: 7, trader: 8 };
 
 export function renderHud(el: HTMLElement, s: WorldSnapshot): void {
   const f = s.fund;
@@ -15,7 +15,7 @@ export function renderHud(el: HTMLElement, s: WorldSnapshot): void {
       ? '<span class="badge sim">SIMULATED DATA</span>'
       : `<span class="muted">${esc(s.provider)} · live</span>`;
   el.innerHTML = `
-    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">PAPER MONEY</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
+    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">${s.execution === 'alpaca' ? 'ALPACA PAPER' : 'PAPER MONEY'}</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
     <div class="chip box"><span class="k">Fund</span><span class="v">${money(f.equity)} <small class="${cls(f.totalReturn)}">${pct(f.totalReturn)}</small></span></div>
     <div class="chip box"><span class="k">Today</span><span class="v ${cls(f.pnlToday)}">${money(f.pnlToday, true)}</span></div>
     <div class="chip box"><span class="k">Drawdown</span><span class="v">${pct(f.drawdown, 1, false)}</span></div>

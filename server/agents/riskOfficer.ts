@@ -48,7 +48,15 @@ export class RiskOfficer extends Agent implements RiskGate {
     const gross = this.ctx.fund.grossExposure() + req.notional;
     if (gross > equity * lim.maxGrossExposure) return deny(`gross exposure would reach ${((gross / equity) * 100).toFixed(0)}%`);
     const sym = this.ctx.fund.symbolExposure(req.symbol) + req.notional;
-    if (sym > equity * lim.maxSymbolExposure) return deny(`${req.symbol} exposure would reach ${((sym / equity) * 100).toFixed(0)}%`);
+    const explored = this.ctx.universe.isExplored(req.symbol);
+    const symCap = explored ? lim.maxExploredSymbolExposure : lim.maxSymbolExposure;
+    if (sym > equity * symCap) return deny(`${req.symbol} exposure would reach ${((sym / equity) * 100).toFixed(0)}% of the ${(symCap * 100).toFixed(0)}% cap`);
+    if (explored) {
+      const all = this.ctx.universe.exploredEntries().reduce((s, e) => s + this.ctx.fund.symbolExposure(e.symbol), 0) + req.notional;
+      if (all > equity * lim.maxExploredExposure) return deny(`explored markets would reach ${((all / equity) * 100).toFixed(0)}% of equity`);
+    }
+    const room = this.ctx.universe.maxNotional(req.symbol);
+    if (req.notional > room) return deny(`order $${req.notional.toFixed(0)} is too big for ${req.symbol} liquidity (cap $${room.toFixed(0)})`);
     const net = this.ctx.fund.netExposure();
     if (req.side === 'long' && net.long + req.notional > equity * lim.maxNetLong) {
       return deny(`net long would reach ${(((net.long + req.notional) / equity) * 100).toFixed(0)}% of the ${(lim.maxNetLong * 100).toFixed(0)}% cap`);

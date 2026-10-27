@@ -38,5 +38,6 @@ export const STAFF = {
   scout: { id: 'p_pip', name: 'Pip', look: { skin: '#ffdbac', hair: '#d2691e', shirt: '#ff8c00', pants: '#4a4a2a', hat: 'cap' } as Appearance },
   reporter: { id: 'g_gus', name: 'Gus', look: { skin: '#e0ac69', hair: '#4a3a2a', shirt: '#8b6b4a', pants: '#3b2b1b', hat: 'press' } as Appearance },
   treasurer: { id: 'b_penny', name: 'Penny', look: { skin: '#f1c27d', hair: '#b8860b', shirt: '#1e7a46', pants: '#1b3b2b', hat: 'tophat' } as Appearance },
+  explorer: { id: 'x_magellan', name: 'Magellan', look: { skin: '#c68642', hair: '#7a3b1a', shirt: '#1f6f8b', pants: '#4a3a2a', hat: 'captain' } as Appearance },
   strategist: { id: 'q_quill', name: 'Prof. Quill', look: { skin: '#f1c27d', hair: '#e8e8e8', shirt: '#5b2a86', pants: '#3b1a56', hat: 'wizard' } as Appearance },
 };

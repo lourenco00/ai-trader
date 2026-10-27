@@ -9,6 +9,8 @@ export interface OrderRequest {
   side: 'buy' | 'sell';
   qty: number;
   refPrice: number;
+  /** True when this order exits an open position, so a venue can close the real position exactly. */
+  closing?: boolean;
 }
 
 export interface Fill {
@@ -31,12 +33,15 @@ export class PaperBroker implements Broker {
   constructor(
     private feeRate: number,
     private slippage: number,
+    /** Per-symbol override: thin markets cost more to trade. */
+    private slippageFor?: (symbol: string) => number,
   ) {}
 
   async marketOrder(req: OrderRequest): Promise<Fill> {
     if (!(req.qty > 0) || !Number.isFinite(req.qty)) throw new Error(`paper broker: invalid qty ${req.qty}`);
     if (!(req.refPrice > 0) || !Number.isFinite(req.refPrice)) throw new Error(`paper broker: invalid price ${req.refPrice}`);
-    const price = req.side === 'buy' ? req.refPrice * (1 + this.slippage) : req.refPrice * (1 - this.slippage);
+    const slip = this.slippageFor ? this.slippageFor(req.symbol) : this.slippage;
+    const price = req.side === 'buy' ? req.refPrice * (1 + slip) : req.refPrice * (1 - slip);
     return {
       symbol: req.symbol,
       side: req.side,

@@ -3,6 +3,7 @@ import type { Broker } from '../broker/broker';
 import type { Config } from '../config';
 import type { LlmClient } from '../llm/client';
 import type { MarketFeed } from '../market/feed';
+import type { Universe } from '../market/universe';
 import type { SignalBoard } from '../signals/board';
 import type { IndicatorCache } from '../strategy/indicators';
 import type { StrategyVault } from '../strategy/vault';
@@ -42,6 +43,7 @@ export interface FundView {
 export interface EcoContext {
   readonly cfg: Config;
   readonly feed: MarketFeed;
+  readonly universe: Universe;
   readonly broker: Broker;
   readonly vault: StrategyVault;
   readonly risk: RiskGate;

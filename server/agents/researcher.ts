@@ -30,17 +30,18 @@ export interface Validation {
   why: string;
 }
 
-export function backtestOptions(ctx: EcoContext): BacktestOptions {
-  return { feeRate: ctx.cfg.feeRate, slippage: ctx.cfg.slippage, barsPerYear: ctx.cfg.barsPerYear };
+export function backtestOptions(ctx: EcoContext, symbol: string): BacktestOptions {
+  return { feeRate: ctx.universe.feeRate(symbol), slippage: ctx.universe.slippage(symbol), barsPerYear: ctx.cfg.barsPerYear };
 }
 
 /** Full train + untouched holdout check. The holdout is the most recent 30% of history. */
 export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation {
-  const opts = backtestOptions(ctx);
+  const opts = backtestOptions(ctx, data.symbol);
   const p = ctx.cfg.research.promotion;
   const train = backtest(data.cache, g, 0, data.trainEnd, opts).metrics;
   const test = backtest(data.cache, g, data.trainEnd, data.cache.length, opts).metrics;
   const fails: string[] = [];
+  if (g.side === 'short' && !ctx.universe.shortable(data.symbol)) fails.push(`${data.symbol} cannot be shorted`);
   if (train.trades < p.minTrainTrades) fails.push(`train trades ${train.trades}<${p.minTrainTrades}`);
   if (train.sharpe < p.minTrainSharpe) fails.push(`train Sharpe ${train.sharpe.toFixed(2)}`);
   if (train.profitFactor < p.minProfitFactor) fails.push(`train PF ${train.profitFactor.toFixed(2)}`);
@@ -94,6 +95,7 @@ export class Researcher extends Agent {
   private data: Dataset | null = null;
   private restUntil = 0;
   private bestEver: Scored | null = null;
+  private epochSymbol: string | null = null;
 
   generation = 0;
   epoch = 0;
@@ -157,13 +159,15 @@ export class Researcher extends Agent {
   }
 
   private beginEpoch(): boolean {
-    const symbols = this.ctx.cfg.symbols;
-    this.symbol = symbols[(this.epoch + this.offset) % symbols.length];
+    // Least recently researched first, so a newly explored market gets attention right away.
+    this.symbol = this.ctx.universe.pickForResearch(this.ctx.cfg.symbols, this.epoch + this.offset);
     const data = this.ctx.dataset(this.symbol);
     if (!data) {
+      this.ctx.universe.finishResearch(this.symbol);
       this.activity = `Waiting for ${this.symbol} data`;
       return false;
     }
+    this.epochSymbol = this.symbol;
     this.data = data;
     this.generation = 0;
     this.scored = [];
@@ -187,7 +191,13 @@ export class Researcher extends Agent {
   }
 
   private evaluate(data: Dataset, g: Genome): void {
-    const opts = backtestOptions(this.ctx);
+    // Shorting is not assumed possible outside the core majors; don't spend CPU on it.
+    if (g.side === 'short' && !this.ctx.universe.shortable(data.symbol)) {
+      this.scored.push({ genome: g, fitness: -10 });
+      this.evaluated++;
+      return;
+    }
+    const opts = backtestOptions(this.ctx, data.symbol);
     const folds = 3;
     const minTrades = Math.ceil(this.ctx.cfg.research.promotion.minTrainTrades / folds);
     // Score each fold of the training window separately. Weighting the worst fold
@@ -284,6 +294,8 @@ export class Researcher extends Agent {
       this.lastResult = `${label}: best candidate failed holdout${closest ? ` (${closest.why})` : ''}`;
     }
     this.epoch++;
+    if (this.epochSymbol) this.ctx.universe.finishResearch(this.epochSymbol);
+    this.epochSymbol = null;
     this.data = null;
     this.population = [];
     this.scored = [];
@@ -336,6 +348,7 @@ export class Researcher extends Agent {
   resetResearch(): void {
     this.immigrants = [];
     this.data = null;
+    this.epochSymbol = null;
     this.discoveries = 0;
   }
 }

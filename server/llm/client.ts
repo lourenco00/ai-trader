@@ -79,7 +79,8 @@ export class LlmClient {
         method: 'POST',
         signal,
         headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model, max_tokens: maxTokens, temperature: opts.temperature ?? 0.7, messages: [{ role: 'user', content: prompt }] }),
+        // Current Claude models reject `temperature`, so Anthropic calls leave sampling at the model default.
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
       });
       if (!res.ok) throw new Error(`anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
       const body = (await res.json()) as { content?: { type: string; text?: string }[]; usage?: { input_tokens?: number; output_tokens?: number } };

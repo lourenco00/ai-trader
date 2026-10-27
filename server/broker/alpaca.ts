@@ -46,11 +46,12 @@ export class AlpacaClient {
 
   // --- Market data -----------------------------------------------------------
 
-  private barsUrl(symbol: string, intervalMs: number, limit: number, pageToken?: string, end?: number): string {
+  private barsUrl(symbol: string, intervalMs: number, limit: number, pageToken?: string, end?: number, start?: number): string {
     const tf = BAR_TIMEFRAME[intervalMs];
     if (!tf) throw new Error(`alpaca: unsupported interval ${intervalMs}`);
     const base = this.cfg.alpaca.dataUrl.replace(/\/$/, '');
     const q = new URLSearchParams({ timeframe: tf, limit: String(limit) });
+    if (start) q.set('start', new Date(start).toISOString());
     if (end) q.set('end', new Date(end).toISOString());
     if (pageToken) q.set('page_token', pageToken);
     if (this.cfg.assetClass(symbol) === 'crypto') {
@@ -80,6 +81,21 @@ export class AlpacaClient {
     const out: Candle[] = [];
     let token: string | undefined;
     let guard = 0;
+    if (this.cfg.assetClass(symbol) === 'stock') {
+      // Stock bars come oldest first from `start` (default: today only), so ask for a
+      // window long enough to hold `bars` regular-session bars and page to the end.
+      const perDay = Math.max(1, Math.floor((6.5 * 3_600_000) / intervalMs));
+      const tradingDays = Math.ceil(bars / perDay) + 5;
+      const start = Date.now() - Math.ceil((tradingDays * 7) / 5) * 86_400_000;
+      while (guard++ < 25) {
+        const url = this.barsUrl(symbol, intervalMs, 10_000, token, undefined, start);
+        const { bars: page, next } = this.parseBars(await this.getJson(url), symbol);
+        out.push(...page);
+        if (!next || page.length === 0) break;
+        token = next;
+      }
+      return dedupe(out).slice(-bars);
+    }
     while (out.length < bars && guard++ < 25) {
       const url = this.barsUrl(symbol, intervalMs, Math.min(10_000, bars - out.length + 1), token);
       const { bars: page, next } = this.parseBars(await this.getJson(url), symbol);
@@ -118,6 +134,42 @@ export class AlpacaClient {
     return out;
   }
 
+  /** Latest trade price for stocks not (yet) registered in the config, which `fetchPrices` would route as crypto. */
+  async latestStockPrices(symbols: string[]): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    if (symbols.length === 0) return out;
+    const base = this.cfg.alpaca.dataUrl.replace(/\/$/, '');
+    const body = (await this.getJson(`${base}/v2/stocks/trades/latest?symbols=${symbols.join(',')}&feed=iex`)) as { trades?: Record<string, { p: number }> };
+    for (const s of symbols) {
+      const t = body.trades?.[s];
+      if (t && Number.isFinite(t.p)) out[s] = t.p;
+    }
+    return out;
+  }
+
+  /** Today's most active and biggest-moving US stocks, from Alpaca's screener. */
+  async screenStocks(top = 50): Promise<{ symbol: string; volume: number; trades: number; price: number | null; changePct: number | null }[]> {
+    const base = this.cfg.alpaca.dataUrl.replace(/\/$/, '');
+    const [active, movers] = await Promise.all([
+      this.getJson(`${base}/v1beta1/screener/stocks/most-actives?by=volume&top=${top}`) as Promise<{ most_actives?: { symbol: string; volume: number; trade_count: number }[] }>,
+      this.getJson(`${base}/v1beta1/screener/stocks/movers?top=${top}`) as Promise<{
+        gainers?: { symbol: string; price: number; percent_change: number }[];
+        losers?: { symbol: string; price: number; percent_change: number }[];
+      }>,
+    ]);
+    const out = new Map<string, { symbol: string; volume: number; trades: number; price: number | null; changePct: number | null }>();
+    for (const a of active.most_actives ?? []) {
+      out.set(a.symbol, { symbol: a.symbol, volume: Number(a.volume) || 0, trades: Number(a.trade_count) || 0, price: null, changePct: null });
+    }
+    for (const m of [...(movers.gainers ?? []), ...(movers.losers ?? [])]) {
+      const cur = out.get(m.symbol) ?? { symbol: m.symbol, volume: 0, trades: 0, price: null, changePct: null };
+      cur.price = Number(m.price) || null;
+      cur.changePct = Number(m.percent_change) / 100;
+      out.set(m.symbol, cur);
+    }
+    return [...out.values()];
+  }
+
   // --- Trading ---------------------------------------------------------------
 
   async clock(): Promise<{ isOpen: boolean; nextOpen: string; nextClose: string }> {
@@ -132,48 +184,109 @@ export class AlpacaClient {
     return { equity: Number(body.equity) || 0, cash: Number(body.cash) || 0, status: body.status ?? 'unknown' };
   }
 
-  /** Submit a market order and poll briefly for the fill. */
-  async submitOrder(req: OrderRequest): Promise<Fill> {
+  private async send(method: 'GET' | 'POST' | 'DELETE', pathAndQuery: string, body?: unknown): Promise<{ status: number; json: unknown }> {
     const base = this.cfg.alpaca.tradingUrl.replace(/\/$/, '');
-    const isCrypto = this.cfg.assetClass(req.symbol) === 'crypto';
-    const apiSymbol = isCrypto ? this.cryptoPair(req.symbol) : req.symbol;
-    const body = {
-      symbol: apiSymbol,
-      side: req.side,
-      type: 'market',
-      time_in_force: isCrypto ? 'gtc' : 'day',
-      qty: String(req.qty),
-    };
-    const res = await fetch(`${base}/v2/orders`, {
-      method: 'POST',
-      headers: { ...this.headers(), 'content-type': 'application/json' },
+    const res = await fetch(`${base}${pathAndQuery}`, {
+      method,
+      headers: { ...this.headers(), ...(body ? { 'content-type': 'application/json' } : {}) },
       signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify(body),
+      body: body ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) throw new Error(`alpaca order ${req.side} ${apiSymbol} -> HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-    const order = (await res.json()) as { id: string };
-    return this.awaitFill(order.id, req);
+    const text = await res.text();
+    let json: unknown = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = text;
+    }
+    return { status: res.status, json };
   }
 
-  private async awaitFill(id: string, req: OrderRequest): Promise<Fill> {
-    const base = this.cfg.alpaca.tradingUrl.replace(/\/$/, '');
+  private orderError(what: string, r: { status: number; json: unknown }): Error {
+    return new Error(`alpaca ${what} -> HTTP ${r.status} ${JSON.stringify(r.json).slice(0, 200)}`);
+  }
+
+  /**
+   * Market order for an entry, or an exact close of the real position for an exit.
+   * Crypto buys are charged in kind, so the quantity held is a little below what was
+   * bought; closing through the positions endpoint sells exactly what is there.
+   */
+  async submitOrder(req: OrderRequest): Promise<Fill> {
+    const isCrypto = this.cfg.assetClass(req.symbol) === 'crypto';
+    const apiSymbol = isCrypto ? this.cryptoPair(req.symbol) : req.symbol;
+    let r;
+    if (req.closing) {
+      // The positions endpoint names crypto without the slash (ETHUSD).
+      r = await this.send('DELETE', `/v2/positions/${apiSymbol.replace('/', '')}`);
+      if (r.status === 404) throw new Error(`alpaca holds no ${apiSymbol} position to close`);
+      if (r.status >= 300) throw this.orderError(`close ${apiSymbol}`, r);
+    } else {
+      // Stocks trade in whole shares: not every name is fractionable and a whole share is clean to close.
+      const qty = isCrypto ? req.qty : Math.floor(req.qty);
+      if (!(qty > 0)) throw new Error(`alpaca: ${req.symbol} order too small for a whole share (${req.qty.toFixed(3)})`);
+      r = await this.send('POST', '/v2/orders', {
+        symbol: apiSymbol,
+        side: req.side,
+        type: 'market',
+        time_in_force: isCrypto ? 'gtc' : 'day',
+        qty: isCrypto ? qty.toFixed(8).replace(/0+$/, '').replace(/\.$/, '') : String(qty),
+      });
+      if (r.status >= 300) throw this.orderError(`${req.side} ${apiSymbol}`, r);
+    }
+    const order = r.json as { id: string };
+    return this.awaitFill(order.id, req, isCrypto);
+  }
+
+  private async awaitFill(id: string, req: OrderRequest, isCrypto: boolean): Promise<Fill> {
     for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, i < 5 ? 300 : 1000));
-      const o = (await this.getJson(`${base}/v2/orders/${id}`, 8000)) as {
-        status?: string;
-        filled_qty?: string;
-        filled_avg_price?: string;
-      };
+      await new Promise((res) => setTimeout(res, i < 5 ? 300 : 1000));
+      const r = await this.send('GET', `/v2/orders/${id}`);
+      const o = r.json as { status?: string; filled_qty?: string; filled_avg_price?: string };
       if (o.status === 'filled') {
         const qty = Number(o.filled_qty) || req.qty;
         const price = Number(o.filled_avg_price) || req.refPrice;
-        return { symbol: req.symbol, side: req.side, qty, price, fee: 0, time: Date.now() };
+        // Alpaca does not report the crypto fee; it is taken from the coins received.
+        const fee = isCrypto ? price * qty * this.cfg.alpacaCryptoFee : 0;
+        return { symbol: req.symbol, side: req.side, qty, price, fee, time: Date.now() };
       }
       if (o.status === 'canceled' || o.status === 'rejected' || o.status === 'expired') {
         throw new Error(`alpaca order ${id} ended ${o.status}`);
       }
     }
-    throw new Error(`alpaca order ${id} did not fill in time`);
+    // Never leave a stray order that could fill later and put the account out of step with the ledger.
+    await this.send('DELETE', `/v2/orders/${id}`).catch(() => undefined);
+    throw new Error(`alpaca order ${id} did not fill in time and was cancelled`);
+  }
+
+  async positions(): Promise<{ symbol: string; qty: number; marketValue: number; side: string }[]> {
+    const r = await this.send('GET', '/v2/positions');
+    if (r.status !== 200 || !Array.isArray(r.json)) throw this.orderError('positions', r);
+    return (r.json as { symbol: string; qty: string; market_value: string; side: string }[]).map((p) => ({
+      // Crypto positions come back as BTCUSD; the ledger uses the bare ticker.
+      symbol: p.symbol.replace(/\/?USD$/, ''),
+      qty: Number(p.qty),
+      marketValue: Number(p.market_value),
+      side: p.side,
+    }));
+  }
+
+  /** What Alpaca will let us trade: USD crypto pairs and non-OTC US equities. Cached by the caller. */
+  async tradableAssets(): Promise<{ crypto: Set<string>; stocks: Set<string> }> {
+    const crypto = new Set<string>();
+    const stocks = new Set<string>();
+    const c = await this.send('GET', '/v2/assets?status=active&asset_class=crypto');
+    if (c.status === 200 && Array.isArray(c.json)) {
+      for (const a of c.json as { symbol: string; tradable: boolean }[]) {
+        if (a.tradable && a.symbol.endsWith('/USD')) crypto.add(a.symbol.slice(0, -4));
+      }
+    }
+    const s = await this.send('GET', '/v2/assets?status=active&asset_class=us_equity');
+    if (s.status === 200 && Array.isArray(s.json)) {
+      for (const a of s.json as { symbol: string; tradable: boolean; exchange: string }[]) {
+        if (a.tradable && a.exchange !== 'OTC') stocks.add(a.symbol);
+      }
+    }
+    return { crypto, stocks };
   }
 }
 
@@ -197,6 +310,7 @@ export class AlpacaProvider implements MarketDataProvider {
  * crypto/stock commissions are 0; slippage is whatever the real fill shows.
  */
 export class AlpacaBroker implements Broker {
+  // Orders go to a real venue, but config refuses anything except the paper account.
   readonly mode = 'live' as const;
   constructor(private client: AlpacaClient) {}
 

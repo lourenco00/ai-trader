@@ -9,6 +9,14 @@ export interface MarketDataProvider {
   fetchPrices(symbols: string[]): Promise<Record<string, number>>;
 }
 
+export interface Ticker24h {
+  base: string;
+  quoteVolume: number;
+  lastPrice: number;
+  change24h: number;
+  trades: number;
+}
+
 async function fetchJson(url: string, timeoutMs = 10_000): Promise<unknown> {
   const res = await fetch(url, {
     signal: AbortSignal.timeout(timeoutMs),
@@ -86,6 +94,29 @@ export class BinanceProvider implements MarketDataProvider {
   async fetchRecent(symbol: string, intervalMs: number, n: number): Promise<Candle[]> {
     const url = `${this.base}/api/v3/klines?symbol=${this.pair(symbol)}&interval=${this.interval(intervalMs)}&limit=${n}`;
     return this.parse(await fetchJson(url));
+  }
+
+  /** 24h stats for every USDT pair on the exchange, in one request. Used by the Explorer. */
+  async fetchTickers24h(): Promise<Ticker24h[]> {
+    const rows = await fetchJson(`${this.base}/api/v3/ticker/24hr?type=MINI`, 30_000);
+    if (!Array.isArray(rows)) throw new Error('binance: unexpected 24hr payload');
+    const out: Ticker24h[] = [];
+    for (const r of rows as Record<string, string | number>[]) {
+      const pair = String(r.symbol ?? '');
+      if (!pair.endsWith('USDT')) continue;
+      const quoteVolume = Number(r.quoteVolume);
+      const lastPrice = Number(r.lastPrice);
+      const open = Number(r.openPrice);
+      if (!Number.isFinite(quoteVolume) || !Number.isFinite(lastPrice) || !(lastPrice > 0)) continue;
+      out.push({
+        base: pair.slice(0, -4),
+        quoteVolume,
+        lastPrice,
+        change24h: open > 0 ? lastPrice / open - 1 : 0,
+        trades: Number(r.count) || 0,
+      });
+    }
+    return out;
   }
 
   async fetchPrices(symbols: string[]): Promise<Record<string, number>> {

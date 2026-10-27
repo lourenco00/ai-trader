@@ -22,9 +22,15 @@ export class Scout extends Agent {
   }
 
   init(): void {
-    for (const s of this.ctx.cfg.symbols) {
-      this.readings.set(s, readRegime(this.ctx.feed.series(s), this.ctx.cfg.barsPerYear));
-    }
+    for (const s of this.ctx.cfg.symbols) this.watch(s);
+  }
+
+  watch(symbol: string): void {
+    this.readings.set(symbol, readRegime(this.ctx.feed.series(symbol), this.ctx.cfg.barsPerYear));
+  }
+
+  forget(symbol: string): void {
+    this.readings.delete(symbol);
   }
 
   onCandle(symbol: string): void {
@@ -102,6 +108,9 @@ export class Scout extends Agent {
         spark,
         marketOpen: this.ctx.marketOpen(symbol),
         newsBias: this.ctx.board.bias(symbol).score,
+        tier: this.ctx.universe.isExplored(symbol) ? 'explored' : 'core',
+        exploreNote: this.ctx.universe.entry(symbol)?.reason ?? null,
+        volumeUsd: this.ctx.universe.volume(symbol),
       };
     });
   }
