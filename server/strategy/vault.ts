@@ -9,6 +9,8 @@ export interface StrategyRecord {
   author: string;
   authorId: string;
   origin: 'evolution' | 'llm';
+  /** See StrategyDTO.trial. Missing on records saved before trials existed. */
+  trial?: boolean;
   createdAt: number;
   fitness: number;
   train: Metrics;
@@ -93,7 +95,19 @@ export class StrategyVault {
       }
       this.items.delete(clone.id);
     }
-    const waiting = this.byStatus('vault');
+    // Trials have their own small shelf so they never push proven strategies out.
+    if (rec.trial) {
+      const trials = this.byStatus('vault').filter((s) => s.trial);
+      if (trials.length >= 6) {
+        const worst = trials.reduce((a, b) => (a.fitness < b.fitness ? a : b));
+        if (worst.fitness >= rec.fitness) return false;
+        this.items.delete(worst.id);
+      }
+      this.items.set(rec.id, rec);
+      this.keys.add(key);
+      return true;
+    }
+    const waiting = this.byStatus('vault').filter((s) => !s.trial);
     if (waiting.length >= this.capacity) {
       const worst = waiting.reduce((a, b) => (a.fitness < b.fitness ? a : b));
       if (worst.fitness >= rec.fitness) return false;
@@ -108,13 +122,14 @@ export class StrategyVault {
    * Best waiting strategy, preferring coins that are not crowded yet. No coin
    * gets more than `maxPerSymbol` traders, so one market can't dominate the floor.
    */
-  bestAvailable(activeSymbols: string[], maxPerSymbol: number, isOpen: (symbol: string) => boolean = () => true): StrategyRecord | undefined {
+  bestAvailable(activeSymbols: string[], maxPerSymbol: number, isOpen: (symbol: string) => boolean = () => true, allowTrial = true): StrategyRecord | undefined {
     const counts = new Map<string, number>();
     for (const s of activeSymbols) counts.set(s, (counts.get(s) ?? 0) + 1);
-    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol && isOpen(s.symbol));
+    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol && isOpen(s.symbol) && (allowTrial || !s.trial));
     if (!waiting.length) return undefined;
     return waiting
-      .map((s) => ({ s, score: s.fitness - 0.5 * (counts.get(s.symbol) ?? 0) }))
+      // Proven strategies always go first; a trial one only gets a trader when nothing better waits.
+      .map((s) => ({ s, score: s.fitness - 0.5 * (counts.get(s.symbol) ?? 0) - (s.trial ? 100 : 0) }))
       .sort((a, b) => b.score - a.score)[0].s;
   }
 
@@ -168,6 +183,7 @@ export function toStrategyDTO(s: StrategyRecord): StrategyDTO {
     author: s.author,
     authorId: s.authorId,
     origin: s.origin,
+    trial: s.trial === true,
     createdAt: s.createdAt,
     rules: describeGenome(s.genome),
     fitness: s.fitness,

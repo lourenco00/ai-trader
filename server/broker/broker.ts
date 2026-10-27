@@ -37,6 +37,8 @@ export class PaperBroker implements Broker {
     private slippage: number,
     /** Per-symbol override: thin markets cost more to trade. */
     private slippageFor?: (symbol: string) => number,
+    /** Per-symbol fee override (US stocks have no commission). */
+    private feeFor?: (symbol: string) => number,
   ) {}
 
   async marketOrder(req: OrderRequest): Promise<Fill> {
@@ -49,7 +51,7 @@ export class PaperBroker implements Broker {
       side: req.side,
       qty: req.qty,
       price,
-      fee: price * req.qty * this.feeRate,
+      fee: price * req.qty * (this.feeFor ? this.feeFor(req.symbol) : this.feeRate),
       time: Date.now(),
     };
   }

@@ -6,7 +6,7 @@ import type { Broker, Fill, OrderRequest } from './broker';
 
 const log = logger('alpaca');
 
-const BAR_TIMEFRAME: Record<number, string> = { 300_000: '5Min', 900_000: '15Min', 3_600_000: '1Hour' };
+const BAR_TIMEFRAME: Record<number, string> = { 300_000: '5Min', 900_000: '15Min', 3_600_000: '1Hour', 14_400_000: '4Hour', 86_400_000: '1Day' };
 
 interface AlpacaBar {
   t: string;
@@ -46,12 +46,14 @@ export class AlpacaClient {
 
   // --- Market data -----------------------------------------------------------
 
-  private barsUrl(symbol: string, intervalMs: number, limit: number, pageToken?: string, end?: number, start?: number): string {
+  private barsUrl(symbol: string, intervalMs: number, limit: number, pageToken?: string, end?: number, start?: number, newestFirst = false): string {
     const tf = BAR_TIMEFRAME[intervalMs];
     if (!tf) throw new Error(`alpaca: unsupported interval ${intervalMs}`);
     const base = this.cfg.alpaca.dataUrl.replace(/\/$/, '');
     const q = new URLSearchParams({ timeframe: tf, limit: String(limit) });
     if (start) q.set('start', new Date(start).toISOString());
+    // Bars come oldest first from `start`, so a plain limit returns the OLDEST bars. Ask for the newest.
+    if (newestFirst) q.set('sort', 'desc');
     if (end) q.set('end', new Date(end).toISOString());
     if (pageToken) q.set('page_token', pageToken);
     if (this.cfg.assetClass(symbol) === 'crypto') {
@@ -84,8 +86,8 @@ export class AlpacaClient {
     if (this.cfg.assetClass(symbol) === 'stock') {
       // Stock bars come oldest first from `start` (default: today only), so ask for a
       // window long enough to hold `bars` regular-session bars and page to the end.
-      const perDay = Math.max(1, Math.floor((6.5 * 3_600_000) / intervalMs));
-      const tradingDays = Math.ceil(bars / perDay) + 5;
+      const perDay = Math.max(0.25, (6.5 * 3_600_000) / intervalMs);
+      const tradingDays = Math.min(4000, Math.ceil(bars / perDay) + 5);
       const start = Date.now() - Math.ceil((tradingDays * 7) / 5) * 86_400_000;
       while (guard++ < 25) {
         const url = this.barsUrl(symbol, intervalMs, 10_000, token, undefined, start);
@@ -107,7 +109,10 @@ export class AlpacaClient {
   }
 
   async fetchRecent(symbol: string, intervalMs: number, n: number): Promise<Candle[]> {
-    const url = this.barsUrl(symbol, intervalMs, n);
+    // Without a start and a descending sort, Alpaca returns the first bars of the day, so new candles
+    // never arrived after startup. Look back a few days so a weekend or holiday is covered.
+    const stock = this.cfg.assetClass(symbol) === 'stock';
+    const url = this.barsUrl(symbol, intervalMs, n, undefined, undefined, stock ? Date.now() - 5 * 86_400_000 : undefined, stock);
     return dedupe(this.parseBars(await this.getJson(url), symbol).bars).slice(-n);
   }
 

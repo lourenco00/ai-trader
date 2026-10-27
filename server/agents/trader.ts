@@ -199,7 +199,7 @@ export class Trader extends Agent {
       return;
     }
     // Leave headroom for fees and slippage so margin never exceeds cash (1x).
-    const notional = this.wallet.cash * Math.min(g.sizePct, 0.99);
+    const notional = this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage;
     if (notional < MIN_NOTIONAL) {
       this.activity = 'Signal fired but my wallet is empty';
       return;
@@ -225,7 +225,7 @@ export class Trader extends Agent {
       });
     } catch (err) {
       // A resting entry that never filled is not an error: the price ran away and we stay flat.
-      if (/not filled|spread too wide/.test((err as Error).message)) {
+      if (/not filled|spread too wide|exceeds live cap/.test((err as Error).message)) {
         this.activity = `${s.symbol} entry skipped: ${(err as Error).message.slice(0, 60)}`;
         this.mood = 'neutral';
         return;

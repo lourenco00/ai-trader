@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { checkLiveApproval, type LiveApproval, type LiveVenue } from './live';
 
 try {
   process.loadEnvFile();
@@ -22,7 +23,7 @@ function bool(name: string, fallback: boolean): boolean {
   return raw === 'true' || raw === '1' || raw === 'yes';
 }
 
-const TIMEFRAMES: Record<string, number> = { '5m': 5 * 60_000, '15m': 15 * 60_000, '1h': 60 * 60_000 };
+const TIMEFRAMES: Record<string, number> = { '5m': 5 * 60_000, '15m': 15 * 60_000, '1h': 60 * 60_000, '4h': 4 * 60 * 60_000, '1d': 24 * 60 * 60_000 };
 
 const timeframe = env.TIMEFRAME?.trim() || '15m';
 const timeframeMs = TIMEFRAMES[timeframe];
@@ -60,6 +61,16 @@ function parseSymbols(raw: string): SymbolSpec[] {
   return out;
 }
 
+// PROFILE=aggressive: looser limits, more leverage, faster rotation. Paper money only, and meant to run
+// beside the standard profile so the two can be compared. It changes how much is risked, never the
+// promotion gate.
+const aggressive = env.PROFILE?.trim().toLowerCase() === 'aggressive';
+// Real money: switching a venue off its paper/demo mode needs the approval file (see server/live.ts).
+const wantsLive =
+  (env.EXECUTION?.trim().toLowerCase() === 'alpaca' && !bool('ALPACA_PAPER', true)) ||
+  (env.EXECUTION?.trim().toLowerCase() === 'okx' && !bool('OKX_DEMO', true));
+if (wantsLive && aggressive) throw new Error('config: live trading cannot use PROFILE=aggressive');
+
 const symbolSpecs = parseSymbols(env.SYMBOLS?.trim() || 'BTC,ETH,SOL');
 if (symbolSpecs.length === 0) throw new Error('config: SYMBOLS must contain at least one symbol like BTC or $NVDA');
 // Both lists are mutable on purpose: the Explorer adds and drops symbols at runtime and
@@ -88,15 +99,16 @@ const okxDemo = bool('OKX_DEMO', true);
 const execMode = (env.EXECUTION?.trim().toLowerCase() || 'paper') as 'paper' | 'alpaca' | 'okx';
 if (!['paper', 'alpaca', 'okx'].includes(execMode)) throw new Error('config: EXECUTION must be paper, alpaca or okx');
 if (execMode === 'okx') {
-  if (!okxDemo) throw new Error('config: EXECUTION=okx requires OKX_DEMO=true. Live trading is deliberately disabled in this build.');
   if (!okxKey || !okxSecret || !okxPass) throw new Error('config: EXECUTION=okx needs OKX_API_KEY, OKX_API_SECRET and OKX_API_PASSPHRASE');
-}
-if (execMode === 'alpaca' && !alpacaPaper) {
-  throw new Error('config: EXECUTION=alpaca requires ALPACA_PAPER=true. Live trading is deliberately disabled in this build.');
 }
 if (execMode === 'alpaca' && (!alpacaKey || !alpacaSecret)) {
   throw new Error('config: EXECUTION=alpaca needs ALPACA_KEY_ID and ALPACA_SECRET');
 }
+
+const liveVenue: LiveVenue | null = execMode === 'alpaca' && !alpacaPaper ? 'alpaca' : execMode === 'okx' && !okxDemo ? 'okx' : null;
+const liveApproval: LiveApproval | null = liveVenue
+  ? checkLiveApproval({ file: env.LIVE_APPROVAL_FILE?.trim() || undefined, venue: liveVenue, dataDir: env.DATA_DIR?.trim() || './data' })
+  : null;
 
 export const config = {
   port: num('PORT', 8787, 1, 65535),
@@ -151,27 +163,29 @@ export const config = {
   researchCpu: num('RESEARCH_CPU', 0.35, 0.05, 0.9),
 
   allocation: {
-    reserveFraction: 0.2,
-    maxTraderFraction: 0.25,
+    reserveFraction: aggressive ? 0.05 : 0.2,
+    maxTraderFraction: aggressive ? 0.4 : 0.25,
     minTraderFraction: 0.03,
     probationTrades: 5,
     rebalanceEveryMs: 60 * 60_000,
   },
 
   risk: {
-    fundMaxDrawdown: 0.2,
-    traderMaxDrawdown: 0.12,
-    dailyLossLimit: 0.05,
-    maxGrossExposure: 1.0,
-    maxSymbolExposure: 0.5,
+    fundMaxDrawdown: aggressive ? 0.3 : 0.2,
+    traderMaxDrawdown: aggressive ? 0.2 : 0.12,
+    dailyLossLimit: aggressive ? 0.08 : 0.05,
+    /** Position size multiplier on a trader's wallet (margin). 1 = fully cash-backed. */
+    leverage: aggressive ? num('LEVERAGE', 2, 1, 4) : 1,
+    maxGrossExposure: aggressive ? num('LEVERAGE', 2, 1, 4) : 1.0,
+    maxSymbolExposure: aggressive ? 0.6 : 0.5,
     /** Cap per explored (non-core) coin or stock: thin books and gappy prices. */
     maxExploredSymbolExposure: 0.15,
     /** Cap across all explored symbols together. */
     maxExploredExposure: 0.5,
     /** A single order may not exceed this share of the symbol's 24h dollar volume. */
     maxVolumeParticipation: 0.005,
-    maxNetLong: 1.0,
-    maxNetShort: 1.0,
+    maxNetLong: aggressive ? num('LEVERAGE', 2, 1, 4) : 1.0,
+    maxNetShort: aggressive ? num('LEVERAGE', 2, 1, 4) : 1.0,
     staleDataMs: 3 * 60_000,
   },
 
@@ -182,28 +196,35 @@ export const config = {
     // 40% of history is held out (about 5 months on hourly bars), up from 30%: a longer exam is harder to get lucky on.
     trainFraction: 0.6,
     promotion: {
-      minTrainTrades: 30,
+      // The aggressive profile wants strategies that trade often, and a bigger sample is also harder to get
+      // lucky on, so it asks for 4x the trades in each window. The quality tests are unchanged.
+      minTrainTrades: aggressive ? 120 : 30,
       minTrainSharpe: 0.3,
-      minTestTrades: 6,
+      minTestTrades: aggressive ? 24 : 6,
       minTestSharpe: 0.5,
       minTestReturn: 0.002,
       maxTestDrawdown: 0.2,
       minProfitFactor: 1.05,
       // The holdout is split in two. A strategy must trade and earn in BOTH halves, so one lucky
       // stretch cannot carry it.
-      minHalfTrades: 2,
+      minHalfTrades: aggressive ? 8 : 2,
       // Every strategy tested on a market's holdout is another lottery ticket. The Sharpe needed
       // rises with how many were tried in the last 7 days, up to this ceiling.
       maxRequiredSharpe: 2.0,
     },
     vaultCapacity: 30,
+    /** Trial strategies (positive holdout, short of the strict gate): how many may trade at once, and their size relative to a proven strategy's probation size. */
+    // Real money runs only strategies that passed the strict gate.
+    maxTrialTraders: wantsLive ? 0 : aggressive ? 5 : 2,
+    trialSizeFactor: aggressive ? 0.5 : 0.25,
   },
 
   retirement: {
     minTradesForJudgement: 6,
-    navFloor: 0.95,
+    navFloor: aggressive ? 0.9 : 0.95,
     minProfitFactorAfter15: 0.8,
-    idleDays: 4,
+    // The aggressive profile rotates idle strategies out sooner so slots go to ones that trade.
+    idleDays: aggressive ? 2 : 4,
   },
 
   llm: {
@@ -241,6 +262,9 @@ export const config = {
     // and the dust at the bottom. If CoinGecko is unreachable the scan falls back to volume alone.
     skipTopRank: Math.round(num('SCAN_SKIP_TOP_RANK', 50, 0, 500)),
     minMarketCapUsd: num('SCAN_MIN_MCAP_USD', 10_000_000, 0, 1e12),
+    /** Largest share of the explored slots stocks may hold, and how many may be added per scan. */
+    stockShare: num('SCAN_STOCK_SHARE', aggressive ? 0.6 : 0.2, 0, 1),
+    stocksPerScan: Math.round(num('SCAN_STOCKS_PER_SCAN', aggressive ? 3 : 1, 0, 10)),
     /** Share of research epochs spent on crypto when both crypto and stocks are on the map. */
     cryptoFocus: num('RESEARCH_CRYPTO_SHARE', 0.75, 0, 1),
     scanStocks: bool('SCAN_STOCKS', hasAlpacaKeys) && hasAlpacaKeys,
@@ -281,6 +305,14 @@ export const config = {
   },
 
   execution: execMode,
+
+  /** Real money. Enabled only with a valid approval file; limits come from it. */
+  live: {
+    enabled: liveVenue !== null,
+    venue: liveVenue,
+    approval: liveApproval,
+    maxOrdersPerHour: num('LIVE_MAX_ORDERS_PER_HOUR', 40, 1, 1000),
+  },
 
   okx: {
     keyId: okxKey,

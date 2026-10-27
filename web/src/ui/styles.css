@@ -719,6 +719,9 @@ canvas.spark {
     animation: none;
   }
 }
+.tag.trial {
+  background: #ffe0b0;
+}
 .tag.explored {
   background: #c9f2c7;
 }

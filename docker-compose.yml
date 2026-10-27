@@ -1,0 +1,53 @@
+# Runs the ecosystems on a server: docker compose up -d --build
+# See deploy/README.md. Secrets come from .env on the server and are never baked into the image.
+#
+# Every port is published on the server's loopback only (127.0.0.1). The village has no login and
+# its buttons pull the kill switch, so reach it through an SSH tunnel or a VPN, never the open internet.
+
+x-app: &app
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    HOST: 0.0.0.0 # inside the container; the host side below is still loopback only
+    TZ: UTC
+
+services:
+  # The Alpaca fund (paper money on your Alpaca paper account).
+  main:
+    <<: *app
+    command: ["npx", "tsx", "server/index.ts"]
+    ports: ["127.0.0.1:8787:8787"]
+    volumes: ["./data:/app/data"]
+
+  # Niche coins on OKX's demo account.
+  niche:
+    <<: *app
+    command: ["npx", "tsx", "server/niche.ts"]
+    ports: ["127.0.0.1:8788:8788"]
+    volumes: ["./data-niche:/app/data-niche"]
+
+  # The high-activity paper profile (simulated $100,000).
+  hi:
+    <<: *app
+    command: ["npx", "tsx", "server/hiact.ts"]
+    ports: ["127.0.0.1:8789:8789"]
+    volumes: ["./data-hi:/app/data-hi"]
+
+  # Real money. Leave this commented out until `npm run approve-live` has written LIVE_APPROVAL.json
+  # and you have set ALPACA_PAPER=false for this service only. It refuses to start without the file.
+  # live:
+  #   <<: *app
+  #   command: ["npx", "tsx", "server/index.ts"]
+  #   environment:
+  #     HOST: 0.0.0.0
+  #     TZ: UTC
+  #     EXECUTION: alpaca
+  #     ALPACA_PAPER: "false"
+  #     DATA_DIR: ./data-live
+  #     PORT: "8790"
+  #   ports: ["127.0.0.1:8790:8790"]
+  #   volumes:
+  #     - ./data-live:/app/data-live
+  #     - ./LIVE_APPROVAL.json:/app/LIVE_APPROVAL.json:ro
+  #     - ./data:/app/data:ro   # the paper evidence the approval points at

@@ -177,7 +177,7 @@ function strategyRows(s: WorldSnapshot, list: StrategyDTO[]): string {
   return list
     .map(
       (st) => `<tr>
-        <td><b>${esc(st.name)}</b> <span class="muted">${esc(st.symbol)} ${st.side.toUpperCase()}</span>
+        <td><b>${esc(st.name)}</b> ${st.trial ? '<span class="tag trial" title="Positive holdout but short of the strict gate: trades small until it proves itself live">trial</span> ' : ''}<span class="muted">${esc(st.symbol)} ${st.side.toUpperCase()}</span>
           <div class="rules">${st.rules.map(esc).join('<br>')}</div></td>
         <td>${st.status === 'active' ? `with ${agentLink(s, st.traderId)}` : 'waiting'}</td>
         <td>${esc(st.author)}${st.origin === 'llm' ? ' (LLM)' : ''}<div class="muted">${ago(st.createdAt)} ago</div></td>

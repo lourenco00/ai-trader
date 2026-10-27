@@ -163,14 +163,14 @@ export class Explorer extends Agent {
     // Crypto first: it trades 24/7 and is where the overlooked small caps are. Stocks only
     // get a seat while their share of the map is small, one per scan.
     const ordered = [...good.filter((c) => c.asset === 'crypto'), ...good.filter((c) => c.asset === 'stock')];
-    // Stocks are a small minority of the map (crypto is the focus), one per scan.
-    const stockCap = Math.max(1, Math.ceil(cfg.maxExplored / 5));
+    // Stocks hold at most `stockShare` of the map and are added `stocksPerScan` at a time.
+    const stockCap = Math.max(cfg.stocksPerScan > 0 ? 1 : 0, Math.ceil(cfg.maxExplored * cfg.stockShare));
     let added = 0;
     let stocksAdded = 0;
     let attempts = 0;
     for (const c of ordered) {
       if (added >= cfg.addPerScan || attempts >= cfg.addPerScan + 4) break;
-      if (c.asset === 'stock' && (stocksAdded >= 1 || universe.exploredEntries().filter((e) => e.asset === 'stock').length >= stockCap)) continue;
+      if (c.asset === 'stock' && (stocksAdded >= cfg.stocksPerScan || universe.exploredEntries().filter((e) => e.asset === 'stock').length >= stockCap)) continue;
       if (universe.exploredCount() >= cfg.maxExplored && !this.makeRoom()) break;
       attempts++;
       const why = await this.ctx.feed.addSymbol(c.symbol, c.asset, cfg.minBars);

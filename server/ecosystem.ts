@@ -19,7 +19,9 @@ import { Strategist } from './agents/strategist';
 import { Reporter, Scout, Treasurer } from './agents/support';
 import { Trader } from './agents/trader';
 import { AlpacaBroker, AlpacaClient } from './broker/alpaca';
+import { GuardedBroker } from './broker/guard';
 import { OkxBroker, OkxClient } from './broker/okx';
+import { assess, loadEvidence } from './verdict';
 import { PaperBroker, type Broker } from './broker/broker';
 import type { Config } from './config';
 import { achievementList, ACHIEVEMENTS, graduation } from './gamification';
@@ -76,6 +78,7 @@ interface SaveFile {
   llmCost: LlmCostState;
   llmAttribution: LlmAttribution;
   universe?: UniverseSave;
+  brokerOffset?: number;
 }
 
 const MAX_NEWS = 300;
@@ -134,6 +137,8 @@ export class Ecosystem implements EcoContext {
   private stockMarketOpen = true;
   private capital: number;
   private lastBrokerCheck = 0;
+  /** Money in the Alpaca account that is not part of the fund (the account is bigger than the cap). */
+  private brokerOffset = 0;
   /** Latest figures from the Alpaca account itself, to compare against the ledger. */
   private brokerAcct: { equity: number; cash: number; at: number } | null = null;
 
@@ -164,9 +169,14 @@ export class Ecosystem implements EcoContext {
         ? new AlpacaBroker(this.alpaca)
         : cfg.execution === 'okx' && this.okx
           ? new OkxBroker(this.okx, cfg)
-          : new PaperBroker(cfg.feeRate, cfg.slippage, (s) => this.universe.slippage(s));
+          : new PaperBroker(cfg.feeRate, cfg.slippage, (s) => this.universe.slippage(s), (s) => this.universe.feeRate(s));
+    if (cfg.live.approval) {
+      this.broker = new GuardedBroker(this.broker, { maxOrderUsd: cfg.live.approval.maxOrderUsd, maxOrdersPerHour: cfg.live.maxOrdersPerHour });
+      log.warn(`LIVE MONEY on ${cfg.live.venue}: cap $${cfg.live.approval.capUsd}, max order $${cfg.live.approval.maxOrderUsd}, stop at -${(cfg.live.approval.maxLossPct * 100).toFixed(0)}%, approval ends ${new Date(cfg.live.approval.expiresAt).toISOString().slice(0, 10)}`);
+    }
     this.vault = new StrategyVault(cfg.research.vaultCapacity);
-    this.capital = cfg.startingCapital;
+    // Real money never starts with more than the approved cap.
+    this.capital = cfg.live.approval ? Math.min(cfg.startingCapital, cfg.live.approval.capUsd) : cfg.startingCapital;
     this.fundState = freshFund(this.capital);
     this.llmCost = freshCost();
     this.llmBudget = new LlmBudget(this.llmCost, cfg.llm.dailyBudgetUsd);
@@ -209,6 +219,7 @@ export class Ecosystem implements EcoContext {
     if (saved && saved.version === 1) {
       this.fundState = { ...freshFund(saved.fund.startingCapital), ...saved.fund };
       this.vault.restore(saved.strategies ?? []);
+      this.brokerOffset = Number(saved.brokerOffset) || 0;
       this.trades = saved.trades ?? [];
       this.newsItems = saved.news ?? [];
       this.equity = saved.equity ?? [];
@@ -300,12 +311,38 @@ export class Ecosystem implements EcoContext {
   private async fundFromAlpaca(): Promise<void> {
     const acct = await this.alpaca!.account();
     if (acct.status !== 'ACTIVE') throw new Error(`Alpaca account is ${acct.status}, not ACTIVE`);
-    const cap = this.cfg.alpacaCapitalCap > 0 ? this.cfg.alpacaCapitalCap : Infinity;
+    const cap = this.cfg.live.approval ? this.cfg.live.approval.capUsd : this.cfg.alpacaCapitalCap > 0 ? this.cfg.alpacaCapitalCap : Infinity;
     this.capital = Math.floor(Math.min(acct.cash, cap));
     if (!(this.capital >= 100)) throw new Error(`Alpaca paper account has only $${acct.cash.toFixed(2)} cash`);
     this.fundState = freshFund(this.capital);
+    this.brokerOffset = acct.equity - this.capital;
     const held = await this.alpaca!.positions().catch(() => []);
     log.info(`funded from Alpaca paper account: $${this.capital} of $${acct.cash.toFixed(2)} cash${held.length ? `; account already holds ${held.map((p) => p.symbol).join(', ')} (not managed by the agents)` : ''}`);
+  }
+
+  private lastEvidenceCheck = 0;
+
+  /**
+   * With real money on, unplug automatically: halt (flatten everything, stop trading) when the loss
+   * limit is hit, the approval expires, the paper evidence turns unprofitable, or the real account
+   * stops matching the books. The halt stays until you resume it by hand.
+   */
+  private async liveWatchdog(): Promise<void> {
+    const a = this.cfg.live.approval;
+    if (!a || this.riskOfficer.halted) return;
+    const eq = this.fundEquity();
+    let reason: string | null = null;
+    if (eq < this.capital * (1 - a.maxLossPct)) reason = `live loss limit: equity $${eq.toFixed(2)} is down more than ${(a.maxLossPct * 100).toFixed(0)}% of the $${this.capital} committed`;
+    else if (Date.now() > a.expiresAt) reason = 'the live approval expired';
+    else if (this.brokerAcct && Math.abs((eq + this.brokerOffset) / this.brokerAcct.equity - 1) > 0.03 && this.cfg.live.venue === 'alpaca') reason = `the books ($${(eq + this.brokerOffset).toFixed(2)}) and Alpaca ($${this.brokerAcct.equity.toFixed(2)}) disagree by more than 3%`;
+    else if (Date.now() - this.lastEvidenceCheck > 3_600_000) {
+      this.lastEvidenceCheck = Date.now();
+      const ev = loadEvidence(a.evidenceDir);
+      const v = ev ? assess(ev, { provenOnly: true }) : null;
+      if (!v) reason = 'the paper evidence can no longer be read';
+      else if (v.code === 'NOT_PROFITABLE') reason = `the paper evidence turned unprofitable: ${v.text}`;
+    }
+    if (reason) await this.riskOfficer.halt(`LIVE UNPLUGGED: ${reason}`);
   }
 
   /** Every minute pull the real account figures; every few minutes check positions agree too. */
@@ -316,9 +353,9 @@ export class Ecosystem implements EcoContext {
       const acct = await this.alpaca.account();
       const prev = this.brokerAcct;
       this.brokerAcct = { equity: acct.equity, cash: acct.cash, at: Date.now() };
-      const gap = this.fundEquity() / acct.equity - 1;
+      const gap = (this.fundEquity() + this.brokerOffset) / acct.equity - 1;
       // Report once when the ledger drifts from the account, and once when it recovers.
-      if (Math.abs(gap) > 0.01 && !(prev && Math.abs(this.fundEquity() / prev.equity - 1) > 0.01)) {
+      if (Math.abs(gap) > 0.01 && !(prev && Math.abs((this.fundEquity() + this.brokerOffset) / prev.equity - 1) > 0.01)) {
         this.news('risk', `Ledger $${this.fundEquity().toFixed(2)} differs from Alpaca $${acct.equity.toFixed(2)} by ${(gap * 100).toFixed(2)}%`, { good: false });
       }
     } catch (err) {
@@ -480,6 +517,7 @@ export class Ecosystem implements EcoContext {
       this.checkPeriodicAchievements(eq);
       if (this.cfg.hasStocks && this.alpaca) void this.refreshStockClock();
       void this.checkBroker();
+      void this.liveWatchdog();
       if (now - this.reporter.lastEditionAt > 6 * 3_600_000) this.publishGazette();
     } catch (err) {
       log.error('minute loop failed', err);
@@ -761,7 +799,7 @@ export class Ecosystem implements EcoContext {
       seasonStartedAt: this.seasonStartedAt,
       mode: 'paper',
       execution: this.cfg.execution === 'alpaca' ? 'alpaca' : this.cfg.execution === 'okx' ? 'okx' : 'local',
-      broker: this.brokerAcct ? { equity: this.brokerAcct.equity, cash: this.brokerAcct.cash, updatedAt: this.brokerAcct.at, gap: eq / this.brokerAcct.equity - 1 } : null,
+      broker: this.brokerAcct ? { equity: this.brokerAcct.equity, cash: this.brokerAcct.cash, updatedAt: this.brokerAcct.at, gap: (eq + this.brokerOffset) / this.brokerAcct.equity - 1 } : null,
       provider: this.feed.provider.name,
       timeframe: this.cfg.timeframe,
       llmEnabled: this.cfg.llm.enabled,
@@ -912,6 +950,7 @@ export class Ecosystem implements EcoContext {
         llmCost: this.llmBudget.snapshot(),
         llmAttribution: this.llmAttribution,
         universe: this.universe.save(),
+        brokerOffset: this.brokerOffset,
       };
       await writeJsonAtomic(this.stateFile, data);
     } catch (err) {

@@ -100,6 +100,7 @@ export function makeRecord(
   v: Validation,
   author: { id: string; name: string },
   origin: 'evolution' | 'llm',
+  trial = false,
 ): StrategyRecord {
   return {
     id: shortId('s_'),
@@ -109,6 +110,7 @@ export function makeRecord(
     author: author.name,
     authorId: author.id,
     origin,
+    trial,
     createdAt: Date.now(),
     fitness: v.fitness,
     train: v.train,
@@ -306,17 +308,25 @@ export class Researcher extends Agent {
     });
 
     let promoted: StrategyRecord | null = null;
+    let trialPick: { genome: Genome; v: Validation } | null = null;
     let closest: Validation | null = null;
     for (const c of candidates.slice(0, 5)) {
       if (this.ctx.vault.has(data.symbol, c.genome)) continue;
       const v = validate(this.ctx, data, c.genome);
       if (!closest || v.fitness > closest.fitness) closest = v;
+      // Positive on the holdout but short of the strict gate: keep the best as a small trial.
+      if (!v.passed && v.passedBasic && (!trialPick || v.fitness > trialPick.v.fitness)) trialPick = { genome: c.genome, v };
       if (!v.passed) continue;
       const rec = makeRecord(data, c.genome, v, this, 'evolution');
       if (this.ctx.vault.add(rec)) {
         promoted = rec;
         break;
       }
+    }
+    let trialRec: StrategyRecord | null = null;
+    if (!promoted && trialPick) {
+      const rec = makeRecord(data, trialPick.genome, trialPick.v, this, 'evolution', true);
+      if (this.ctx.vault.add(rec)) trialRec = rec;
     }
 
     const label = `Epoch ${this.epoch + 1} on ${data.symbol}`;
@@ -328,6 +338,10 @@ export class Researcher extends Agent {
       this.ctx.news('discovery', `${this.name} discovered "${promoted.name}" for ${promoted.symbol}: holdout ${pct(promoted.test.totalReturn)}, Sharpe ${promoted.test.sharpe.toFixed(2)}`, { agentId: this.id, good: true });
       this.ctx.emit({ kind: 'discovery', agentId: this.id, text: `Eureka! ${promoted.name}`, building: 'vault' });
       this.ctx.unlock('eureka');
+    } else if (trialRec) {
+      this.addXp(15);
+      this.lastResult = `${label}: ${trialRec.name} goes on trial (holdout ${pct(trialRec.test.totalReturn)}, short of the strict gate: ${trialPick?.v.why.slice(0, 60)})`;
+      this.ctx.news('discovery', `${this.name}'s "${trialRec.name}" (${trialRec.symbol}) is on trial: positive holdout, but below the strict gate`, { agentId: this.id });
     } else if (candidates.length === 0) {
       this.lastResult = `${label}: nothing beat fees in training`;
     } else {

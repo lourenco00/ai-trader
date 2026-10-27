@@ -1,0 +1,25 @@
+#cloud-config
+# Paste this into the "Cloud config" box when creating the server. It creates a key-only user, installs
+# Docker, turns on the firewall (SSH only) and automatic security updates. The key below is a PUBLIC key.
+users:
+  - name: trader
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDDoQNmQ1Qkeklr3nMcK/cnQucRpBHL0XMeNASg05vkK8cS2gqw2+F/C5QcjcYE/Fc5CzdsA+dxRuV+IMmEeGDyuj5EJ/kCBBSY+7vbkUFMyKtUw3advttIFg1xXQUxiLFhnpHEkX+WNO2ZtQk9xnQJuMbpPIK4GCTUqyGvJz9Ok3T27ZL6+t51Fn55H4EIKVXQWLRPsfSP/tYLNH2f2TsEgR3EnYUVWosPRJPF+TIJ/Ey6RfYUStlfu3svsyAo+XlRcpL6PErX7/1uzEEA/NTWwjBlZS8FT4NtIpFLoud3jhoUayEWfeA/TgnU3UD7yfPSf2AfVXgmhaLU5j5HP/U9/a+R/UPxUXLUWJyNl/ViLF7lMvgWyOZVGSRYxquWY2s0toblqwtt6+nGYFiuJNso+SSHeVsLH5RNYpaKww3bktA5L+N6QW/xEP0GT5rfPVHS6tgXusmKK2QGQLGQlEzRrZC0YS+HV5HaoTNOY+g1UgWCbNedoqaHb3bfpx7XTo7tn8EO4qktGCpn7QA8BJm9amZWODEe+oVS0VSWwNuOFhW/JhZEdMhUmXyES1S58ouLy4nknrMZNJeqTpjLthuUmQjgEtR68UmfNXP04f0QmNKO7ERDs0SfqiSKFjuzrLswOyhBmh5TqxbaDYuyG+PP/H1o1x8cU4xZWP7gEjhoRw== lourencoramossantos@gmail.com
+package_update: true
+packages:
+  - ufw
+  - unattended-upgrades
+  - ca-certificates
+  - curl
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker trader
+  - ufw default deny incoming
+  - ufw allow OpenSSH
+  - ufw --force enable
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  - systemctl restart ssh
+  - touch /var/lib/cloud/ai-trader-ready

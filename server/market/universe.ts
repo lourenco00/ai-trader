@@ -157,7 +157,9 @@ export class Universe {
    */
   barsPerYear(symbol: string): number {
     if (this.cfg.assetClass(symbol) === 'crypto') return this.cfg.barsPerYear;
-    return Math.floor((6.5 * 3_600_000) / this.cfg.timeframeMs) * 252;
+    // Slower than the 6.5h session means one bar a day.
+    const perDay = Math.max(1, (6.5 * 3_600_000) / this.cfg.timeframeMs);
+    return perDay * 252;
   }
 
   /** Per-side fee as a fraction, matching what the execution venue really charges. */
@@ -166,6 +168,7 @@ export class Universe {
       const { makerFee, takerFee } = this.cfg.okx;
       return this.cfg.limitOrders ? (makerFee + takerFee) / 2 + 0.0002 : takerFee;
     }
+    if (this.cfg.execution === 'paper') return this.cfg.assetClass(symbol) === 'stock' ? 0 : this.cfg.feeRate;
     if (this.cfg.execution !== 'alpaca') return this.cfg.feeRate;
     if (this.cfg.assetClass(symbol) !== 'crypto') return 0;
     // Entries and calm exits go out as limit orders when they can; stops always pay the taker fee.

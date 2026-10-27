@@ -16,6 +16,9 @@
     "serve": "tsx server/index.ts",
     "report": "tsx server/report.ts",
     "niche": "tsx server/niche.ts",
+    "hi": "tsx server/hiact.ts",
+    "daily": "tsx server/daily.ts",
+    "approve-live": "tsx server/approve-live.ts",
     "coin": "tsx server/coin.ts",
     "typecheck": "tsc -p tsconfig.server.json && tsc -p web/tsconfig.json"
   },

@@ -93,6 +93,8 @@ export interface StrategyDTO {
   author: string;
   authorId: string;
   origin: 'evolution' | 'llm';
+  /** On trial: passed the basic holdout checks but not the strict gate, so it trades small until it proves itself live. */
+  trial: boolean;
   createdAt: number;
   rules: string[];
   fitness: number;

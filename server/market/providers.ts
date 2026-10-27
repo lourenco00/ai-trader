@@ -42,7 +42,7 @@ function finite(n: number, what: string): number {
 // Binance (public market data, no key needed)
 // ---------------------------------------------------------------------------
 
-const BINANCE_INTERVALS: Record<number, string> = { 300_000: '5m', 900_000: '15m', 3_600_000: '1h' };
+const BINANCE_INTERVALS: Record<number, string> = { 300_000: '5m', 900_000: '15m', 3_600_000: '1h', 14_400_000: '4h', 86_400_000: '1d' };
 
 export class BinanceProvider implements MarketDataProvider {
   readonly name = 'binance';
@@ -139,7 +139,7 @@ export class BinanceProvider implements MarketDataProvider {
 // pairs that dominate OKX's volume are closed to EU residents.
 // ---------------------------------------------------------------------------
 
-const OKX_BARS: Record<number, string> = { 300_000: '5m', 900_000: '15m', 3_600_000: '1H' };
+const OKX_BARS: Record<number, string> = { 300_000: '5m', 900_000: '15m', 3_600_000: '1H', 14_400_000: '4H', 86_400_000: '1D' };
 
 export class OkxProvider implements MarketDataProvider {
   readonly name = 'okx';

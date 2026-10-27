@@ -81,11 +81,13 @@ export class Commander extends Agent {
       const activeSymbols = this.traders.filter((x) => x.strategy).map((x) => x.strategy!.symbol);
       const maxPerSymbol = Math.max(1, Math.ceil(this.traders.length / this.ctx.cfg.symbols.length));
       // A trader given a strategy for a shut market would just stand idle; crypto never closes.
-      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol, (sym) => this.ctx.marketOpen(sym));
+      // Only a few traders at a time run trial strategies, so unproven ideas stay a small part of the fund.
+      const trialsActive = this.traders.filter((x) => x.strategy?.trial).length;
+      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol, (sym) => this.ctx.marketOpen(sym), trialsActive < this.ctx.cfg.research.maxTrialTraders);
       if (!s) return;
       this.ctx.vault.assign(s.id, t.id);
       t.assign(s);
-      const target = this.ctx.fund.equity() * this.baseFraction() * 0.5; // probation size
+      const target = this.ctx.fund.equity() * this.baseFraction() * (s.trial ? this.ctx.cfg.research.trialSizeFactor : 0.5); // probation size, smaller on trial
       const amount = Math.min(target, this.treasury.reserve - this.minReserve());
       if (amount > 0) {
         this.treasury.reserve -= amount;
@@ -148,6 +150,7 @@ export class Commander extends Agent {
         fraction = base * Math.max(0.25, Math.min(2, 1 + ret * 10));
       }
       fraction = Math.min(a.maxTraderFraction, Math.max(a.minTraderFraction, fraction));
+      if (t.strategy.trial) fraction = Math.min(fraction, base * Math.max(0.5, this.ctx.cfg.research.trialSizeFactor * 2));
       const target = equity * fraction;
       const current = t.equity();
       const delta = target - current;
@@ -180,12 +183,19 @@ export class Commander extends Agent {
       const s = t.strategy;
       if (!s) continue;
       const live = s.live;
+      // A trial that proves itself live earns full status and full-size capital.
+      if (s.trial && live.trades >= 10 && live.grossLoss > 0 && live.grossWin / live.grossLoss >= 1.3 && t.navSinceAssign() > 1) {
+        s.trial = false;
+        this.addXp(20);
+        this.ctx.news('allocation', `"${s.name}" (${s.symbol}) passed its trial live: profit factor ${(live.grossWin / live.grossLoss).toFixed(2)} over ${live.trades} trades. Full status`, { agentId: this.id, good: true });
+      }
       const pf = live.grossLoss > 0 ? live.grossWin / live.grossLoss : live.grossWin > 0 ? 99 : 0;
       const idleMs = Date.now() - (live.lastTradeAt ?? t.assignedAt);
       let reason: string | null = null;
       if (t.drawdownSinceAssign() > maxDd) reason = `drawdown ${pct(-t.drawdownSinceAssign())} breached the ${pct(-maxDd)} limit`;
       else if (live.trades >= r.minTradesForJudgement && t.navSinceAssign() < r.navFloor) reason = `lost ${pct(t.navSinceAssign() - 1)} on probation`;
       else if (live.trades >= 15 && pf < r.minProfitFactorAfter15) reason = `profit factor ${pf.toFixed(2)} after ${live.trades} trades`;
+      else if (s.trial && live.trades >= 8 && pf < 1) reason = `trial failed: profit factor ${pf.toFixed(2)} after ${live.trades} trades`;
       else if (!t.wallet.position && idleMs > r.idleDays * 86_400_000) reason = `no trades for ${r.idleDays} days`;
       if (reason) await this.retire(t, reason);
     }
@@ -216,7 +226,7 @@ export class Commander extends Agent {
       if (!data) continue;
       const v = validate(this.ctx, data, s.genome);
       this.ctx.countEvaluated(1);
-      if (v.passed) {
+      if (s.trial ? v.passedBasic : v.passed) {
         s.test = v.test;
         s.train = v.train;
         s.fitness = v.fitness;

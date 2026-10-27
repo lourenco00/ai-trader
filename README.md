@@ -55,6 +55,14 @@ Up to 10 explored markets are kept (`SCAN_MAX_EXPLORED`). The researchers always
 
 Small caps are treated more harshly than BTC, on purpose: slippage rises as 24h volume falls (3 bps up to 43 bps), strategies on explored markets are long-only, one order can use at most 0.5% of the market's daily volume, and Sarge caps each explored market at 15% of the fund and all of them together at 50%. Run `npm run report` any time for a plain verdict on the season.
 
+## The high-activity profile
+
+`npm run hi` starts a third ecosystem (http://localhost:8789) with its own simulated $100,000, built to trade as much as the evidence allows: 10 traders, 8 researchers using 80% of a core, 15-minute candles, liquid US stocks (commission-free) plus BTC and ETH, 2x leverage, 5% reserve, wider loss limits, up to 5 trial traders at half size, idle strategies rotated out after 2 days, and stocks taking up to 60% of the explored slots. The promotion gate is the same as everywhere else; only the amount risked changes. Fills are simulated against live Alpaca and Binance prices, so it never touches your Alpaca account. Compare it with the standard fund via `npm run report` (set `DATA_DIR=./data-hi`).
+
+## Real money, and the server
+
+Real money is off by default and cannot be switched on by editing .env alone. `npm run approve-live` writes `LIVE_APPROVAL.json` only when the paper evidence (proven strategies only) says PASSING, and only after you type a confirmation sentence and set a capital cap, a per-order cap and a loss limit. The approval expires after 30 days. While live, the fund unplugs itself if the loss limit is hit, the approval expires, the evidence turns unprofitable, or the books stop matching the account, and strategies on trial are not allowed. `npm run daily` shows the season day by day. To run everything on an always-on server, see [deploy/README.md](deploy/README.md).
+
 ## Before real money
 
 The Command Center tracks a Real Money License: 30+ days on real data, 100+ trades, positive net return, max drawdown under 15%, hourly Sharpe of 1.0+, and 3+ strategies profitable after 10 live trades. Treat a full license as evidence, not a guarantee. Paper fills ignore order-book depth, partial fills, funding rates, exchange downtime and withdrawal risk, and many strategies that look good for a month stop working.
