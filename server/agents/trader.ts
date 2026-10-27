@@ -261,7 +261,7 @@ export class Trader extends Agent {
     const price = this.ctx.feed.price(p.symbol);
     if (price === undefined) return;
     // A stock order sent after the bell would sit until the next open; stops resume then.
-    if (!this.ctx.marketOpen(p.symbol)) return;
+    if (!this.ctx.marketOpen(p.symbol, true)) return;
     const long = p.side === 'long';
     if (long ? price <= p.stop : price >= p.stop) {
       await this.close(price, p.stop === p.entryPrice ? 'breakeven stop' : 'stop loss');

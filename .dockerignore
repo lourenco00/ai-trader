@@ -2,6 +2,7 @@ node_modules
 web/dist
 .git
 .env
+secrets.env
 data
 data-niche
 data-hi

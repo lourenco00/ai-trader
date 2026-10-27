@@ -2,6 +2,7 @@ node_modules/
 web/dist/
 data/
 .env
+secrets.env
 *.log
 .DS_Store
 data-niche/

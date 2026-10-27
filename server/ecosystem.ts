@@ -135,6 +135,8 @@ export class Ecosystem implements EcoContext {
   private agents: Agent[] = [];
   private llmPausedReason: string | null = null;
   private stockMarketOpen = true;
+  /** When the open US session ends (ms), from the Alpaca clock. 0 when closed or unknown. */
+  private stockCloseAt = 0;
   private capital: number;
   private lastBrokerCheck = 0;
   /** Money in the Alpaca account that is not part of the fund (the account is bigger than the cap). */
@@ -530,6 +532,13 @@ export class Ecosystem implements EcoContext {
       const clock = await this.alpaca.clock();
       const was = this.stockMarketOpen;
       this.stockMarketOpen = clock.isOpen;
+      this.stockCloseAt = clock.isOpen ? Date.parse(clock.nextClose) || 0 : 0;
+      if (clock.isOpen && this.closingSoon()) {
+        // Day trading: leave nothing in stocks overnight.
+        for (const t of this.traders) {
+          if (t.wallet.position && this.cfg.assetClass(t.wallet.position.symbol) === 'stock') void t.flatten('end of day');
+        }
+      }
       if (was !== clock.isOpen) {
         this.news('market', `US stock market ${clock.isOpen ? 'opened' : 'closed'}. Stock traders ${clock.isOpen ? 'back on the floor' : 'heading home'}.`);
         if (!clock.isOpen && this.cfg.execution !== 'alpaca') {
@@ -662,10 +671,17 @@ export class Ecosystem implements EcoContext {
     // Spend is recorded by the LlmClient; this hook exists for future per-agent accounting.
   }
 
-  marketOpen(symbol: string): boolean {
+  /** In the last few minutes before the close of a day-trading fund. */
+  private closingSoon(): boolean {
+    const min = this.cfg.flattenBeforeCloseMin;
+    return min > 0 && this.stockCloseAt > 0 && this.stockCloseAt - Date.now() <= min * 60_000;
+  }
+
+  /** `forExit`: stops and exits keep working until the real close; only new entries stop early. */
+  marketOpen(symbol: string, forExit = false): boolean {
     if (this.cfg.assetClass(symbol) === 'crypto') return true;
     // Stocks: trust the cached Alpaca clock; default open if we have not polled yet.
-    return this.stockMarketOpen;
+    return this.stockMarketOpen && (forExit || !this.closingSoon());
   }
 
   /** Attribute a closed trade's P&L to the LLM if its strategy was LLM-authored. */

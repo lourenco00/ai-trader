@@ -13,15 +13,15 @@ $pack = Join-Path $env:TEMP 'ai-trader-deploy.tgz'
 $dirOf = @{ main = 'data'; niche = 'data-niche'; hi = 'data-hi' }
 
 Write-Host 'Packing the project (no secrets, no data, no node_modules)...'
-tar -czf $pack -C $root --exclude=node_modules --exclude=.git --exclude=web/dist --exclude=data --exclude=data-niche --exclude=data-hi --exclude=data-live --exclude=.env --exclude=LIVE_APPROVAL.json --exclude='*.log' .
+tar -czf $pack -C $root --exclude=node_modules --exclude=.git --exclude=web/dist --exclude=data --exclude=data-niche --exclude=data-hi --exclude=data-live --exclude=.env --exclude=secrets.env --exclude=LIVE_APPROVAL.json --exclude='*.log' .
 
 Write-Host "Copying to $Server ..."
 scp $pack "${Server}:ai-trader.tgz"
 ssh $Server 'mkdir -p ai-trader && tar -xzf ai-trader.tgz -C ai-trader && rm ai-trader.tgz'
 
-Write-Host 'Copying .env (API keys) over SSH...'
-scp (Join-Path $root '.env') "${Server}:ai-trader/.env"
-ssh $Server 'chmod 600 ai-trader/.env'
+Write-Host 'Copying .env (API keys) over SSH as secrets.env...'
+scp (Join-Path $root '.env') "${Server}:ai-trader/secrets.env"
+ssh $Server 'chmod 600 ai-trader/secrets.env'
 
 if ($IncludeState) {
   foreach ($s in $Services) {

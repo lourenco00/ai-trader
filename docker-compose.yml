@@ -7,7 +7,11 @@
 x-app: &app
   build: .
   restart: unless-stopped
-  env_file: .env
+  # raw: no $ interpolation, so SYMBOLS=$SPY,$QQQ arrives intact. Named secrets.env (not .env) so Compose does
+  # not also read it for its own variable substitution.
+  env_file:
+    - path: secrets.env
+      format: raw
   environment:
     HOST: 0.0.0.0 # inside the container; the host side below is still loopback only
     TZ: UTC

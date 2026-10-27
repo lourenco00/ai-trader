@@ -62,5 +62,5 @@ export interface EcoContext {
   /** Record that an LLM-driven agent produced value, for the earn-your-keep check. */
   attributeLlm(agentId: string): void;
   /** Is the market for this symbol open now? Crypto is always open; stocks follow US hours. */
-  marketOpen(symbol: string): boolean;
+  marketOpen(symbol: string, forExit?: boolean): boolean;
 }

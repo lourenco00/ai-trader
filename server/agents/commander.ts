@@ -79,7 +79,7 @@ export class Commander extends Agent {
     for (const t of this.traders) {
       if (t.strategy) continue;
       const activeSymbols = this.traders.filter((x) => x.strategy).map((x) => x.strategy!.symbol);
-      const maxPerSymbol = Math.max(1, Math.ceil(this.traders.length / this.ctx.cfg.symbols.length));
+      const maxPerSymbol = Math.max(this.ctx.cfg.research.minTradersPerMarketCap, Math.ceil(this.traders.length / this.ctx.cfg.symbols.length));
       // A trader given a strategy for a shut market would just stand idle; crypto never closes.
       // Only a few traders at a time run trial strategies, so unproven ideas stay a small part of the fund.
       const trialsActive = this.traders.filter((x) => x.strategy?.trial).length;

@@ -198,16 +198,16 @@ export const config = {
     promotion: {
       // The aggressive profile wants strategies that trade often, and a bigger sample is also harder to get
       // lucky on, so it asks for 4x the trades in each window. The quality tests are unchanged.
-      minTrainTrades: aggressive ? 120 : 30,
+      minTrainTrades: num('MIN_TRAIN_TRADES', aggressive ? 120 : 30, 5, 2000),
       minTrainSharpe: 0.3,
-      minTestTrades: aggressive ? 24 : 6,
+      minTestTrades: num('MIN_TEST_TRADES', aggressive ? 24 : 6, 2, 500),
       minTestSharpe: 0.5,
       minTestReturn: 0.002,
       maxTestDrawdown: 0.2,
       minProfitFactor: 1.05,
       // The holdout is split in two. A strategy must trade and earn in BOTH halves, so one lucky
       // stretch cannot carry it.
-      minHalfTrades: aggressive ? 8 : 2,
+      minHalfTrades: num('MIN_HALF_TRADES', aggressive ? 8 : 2, 1, 250),
       // Every strategy tested on a market's holdout is another lottery ticket. The Sharpe needed
       // rises with how many were tried in the last 7 days, up to this ceiling.
       maxRequiredSharpe: 2.0,
@@ -216,6 +216,8 @@ export const config = {
     /** Trial strategies (positive holdout, short of the strict gate): how many may trade at once, and their size relative to a proven strategy's probation size. */
     // Real money runs only strategies that passed the strict gate.
     maxTrialTraders: wantsLive ? 0 : aggressive ? 5 : 2,
+    /** Fewest traders allowed on one market. The aggressive profile lets 3 share a market so no trader sits idle while good strategies wait. */
+    minTradersPerMarketCap: aggressive ? 3 : 1,
     trialSizeFactor: aggressive ? 0.5 : 0.25,
   },
 
@@ -305,6 +307,12 @@ export const config = {
   },
 
   execution: execMode,
+
+  /**
+   * Day trading: stop opening stock positions this many minutes before the US close and flatten what is
+   * open, so nothing is held overnight. 0 = off. (Crypto is unaffected.)
+   */
+  flattenBeforeCloseMin: num('FLATTEN_BEFORE_CLOSE_MIN', 0, 0, 60),
 
   /** Real money. Enabled only with a valid approval file; limits come from it. */
   live: {
