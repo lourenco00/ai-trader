@@ -15,8 +15,9 @@ export function renderHud(el: HTMLElement, s: WorldSnapshot): void {
       ? '<span class="badge sim">SIMULATED DATA</span>'
       : `<span class="muted">${esc(s.provider)} · live</span>`;
   el.innerHTML = `
-    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">${s.execution === 'alpaca' ? 'ALPACA PAPER' : 'PAPER MONEY'}</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
+    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">${s.execution === 'alpaca' ? 'ALPACA PAPER' : s.execution === 'okx' ? 'OKX DEMO' : 'SIMULATED FILLS'}</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
     <div class="chip box"><span class="k">Fund</span><span class="v">${money(f.equity)} <small class="${cls(f.totalReturn)}">${pct(f.totalReturn)}</small></span></div>
+    ${s.broker ? `<div class="chip box" title="The real Alpaca paper account. Ledger vs Alpaca: ${(s.broker.gap * 100).toFixed(2)}%"><span class="k">Alpaca</span><span class="v">${money(s.broker.equity)}</span></div>` : ''}
     <div class="chip box"><span class="k">Today</span><span class="v ${cls(f.pnlToday)}">${money(f.pnlToday, true)}</span></div>
     <div class="chip box"><span class="k">Drawdown</span><span class="v">${pct(f.drawdown, 1, false)}</span></div>
     <div class="chip box"><span class="k">Open</span><span class="v">${f.openPositions}</span></div>

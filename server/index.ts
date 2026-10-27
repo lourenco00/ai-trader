@@ -88,6 +88,12 @@ async function main(): Promise<void> {
         return serveStatic(res, url.pathname);
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return sendJson(res, 200, eco.snapshot());
+      if (req.method === 'GET' && url.pathname.startsWith('/api/coin/')) {
+        const q = decodeURIComponent(url.pathname.slice('/api/coin/'.length));
+        if (!/^[A-Za-z0-9._-]{1,64}$/.test(q)) return sendJson(res, 400, { error: 'bad symbol' });
+        const d = await eco.intel.lookup(q);
+        return d ? sendJson(res, 200, d) : sendJson(res, 404, { error: 'not found, or the free rate limit is exhausted' });
+      }
       if (req.method === 'GET' && url.pathname === '/api/health') {
         return sendJson(res, 200, { ok: true, provider: eco.feed.provider.name, lastData: eco.feed.lastUpdate, stale: eco.feed.isStale() });
       }

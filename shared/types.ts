@@ -324,7 +324,9 @@ export interface WorldSnapshot {
   seasonStartedAt: number;
   mode: 'paper';
   /** Where orders are filled: a local simulator, or the Alpaca paper account. */
-  execution: 'local' | 'alpaca';
+  execution: 'local' | 'alpaca' | 'okx';
+  /** The real Alpaca account, when it is the venue, so the fund can be checked against it. */
+  broker: { equity: number; cash: number; updatedAt: number; gap: number } | null;
   provider: string;
   timeframe: string;
   llmEnabled: boolean;

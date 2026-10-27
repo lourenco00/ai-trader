@@ -27,7 +27,28 @@ export interface Validation {
   test: Metrics;
   fitness: number;
   passed: boolean;
+  /** Passes the original train + holdout checks, before the walk-forward and multiple-testing rules. */
+  passedBasic: boolean;
+  needSharpe: number;
   why: string;
+}
+
+/** Sharpe of just holding the asset over [from, to). The yardstick a long strategy must beat. */
+export function holdSharpe(close: ArrayLike<number>, from: number, to: number, barsPerYear: number): number {
+  let n = 0;
+  let sum = 0;
+  let sum2 = 0;
+  for (let i = Math.max(1, from); i < to; i++) {
+    if (!(close[i - 1] > 0) || !(close[i] > 0)) continue;
+    const r = close[i] / close[i - 1] - 1;
+    n++;
+    sum += r;
+    sum2 += r * r;
+  }
+  if (n < 2) return 0;
+  const m = sum / n;
+  const sd = Math.sqrt(Math.max(0, sum2 / n - m * m));
+  return sd > 0 ? (m / sd) * Math.sqrt(barsPerYear) : 0;
 }
 
 export function backtestOptions(ctx: EcoContext, symbol: string): BacktestOptions {
@@ -40,6 +61,10 @@ export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation 
   const p = ctx.cfg.research.promotion;
   const train = backtest(data.cache, g, 0, data.trainEnd, opts).metrics;
   const test = backtest(data.cache, g, data.trainEnd, data.cache.length, opts).metrics;
+  // Walk-forward: the holdout in two halves, judged separately.
+  const mid = data.trainEnd + Math.floor((data.cache.length - data.trainEnd) / 2);
+  const early = backtest(data.cache, g, data.trainEnd, mid, opts).metrics;
+  const late = backtest(data.cache, g, mid, data.cache.length, opts).metrics;
   const fails: string[] = [];
   if (g.side === 'short' && !ctx.universe.shortable(data.symbol)) fails.push(`${data.symbol} cannot be shorted`);
   if (train.trades < p.minTrainTrades) fails.push(`train trades ${train.trades}<${p.minTrainTrades}`);
@@ -50,8 +75,23 @@ export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation 
   if (test.totalReturn <= p.minTestReturn) fails.push(`test return ${(test.totalReturn * 100).toFixed(1)}%`);
   if (test.maxDrawdown > p.maxTestDrawdown) fails.push(`test DD ${(test.maxDrawdown * 100).toFixed(0)}%`);
   if (test.profitFactor < p.minProfitFactor) fails.push(`test PF ${test.profitFactor.toFixed(2)}`);
+  const passedBasic = fails.length === 0;
+  const looks = ctx.universe.noteLook(data.symbol);
+  const years = Math.max(0.05, (data.cache.length - data.trainEnd) / ctx.universe.barsPerYear(data.symbol));
+  const haircut = (0.5 * Math.sqrt(2 * Math.log(Math.max(2, looks)))) / Math.sqrt(years);
+  const needSharpe = Math.min(p.maxRequiredSharpe, p.minTestSharpe + haircut);
+  if (test.sharpe < needSharpe) fails.push(`holdout Sharpe ${test.sharpe.toFixed(2)} < ${needSharpe.toFixed(2)} needed after ${looks} looks`);
+  for (const [name, h] of [['first', early], ['second', late]] as const) {
+    if (h.trades < p.minHalfTrades) fails.push(`${name} half only ${h.trades} trades`);
+    else if (h.totalReturn <= 0) fails.push(`${name} half lost ${(h.totalReturn * 100).toFixed(1)}%`);
+  }
+  // A long strategy that does no better than simply holding through a rally has shown no skill, only a rising market.
+  if (g.side === 'long') {
+    const bench = holdSharpe(data.cache.c, data.trainEnd, data.cache.length, ctx.universe.barsPerYear(data.symbol));
+    if (test.sharpe <= bench) fails.push(`holdout Sharpe ${test.sharpe.toFixed(2)} no better than buy-and-hold ${bench.toFixed(2)}`);
+  }
   const score = 0.5 * fitness(train, p.minTrainTrades) + 0.5 * fitness(test, p.minTestTrades);
-  return { train, test, fitness: score, passed: fails.length === 0, why: fails.join(', ') };
+  return { train, test, fitness: score, passed: fails.length === 0, passedBasic, needSharpe, why: fails.join(', ') };
 }
 
 export function makeRecord(

@@ -1,11 +1,15 @@
 import type { Appearance, Candle } from '../../shared/types';
 import type { AlpacaClient } from '../broker/alpaca';
-import { BinanceProvider } from '../market/providers';
+import type { OkxClient } from '../broker/okx';
+import type { MarketDataProvider, Ticker24h } from '../market/providers';
 import { logger } from '../util/log';
 import { Agent } from './base';
 import type { EcoContext } from './context';
 
 const log = logger('explorer');
+
+/** A market data provider that can list every pair's 24h numbers (Binance, OKX). */
+type TickerSource = MarketDataProvider & { fetchTickers24h(): Promise<Ticker24h[]> };
 
 interface Candidate {
   symbol: string;
@@ -95,6 +99,7 @@ export class Explorer extends Agent {
     name: string,
     appearance: Appearance,
     private alpaca: AlpacaClient | null,
+    private okx: OkxClient | null = null,
   ) {
     super(ctx, id, name, 'explorer', 'Explorer', 'lab', appearance);
     if (!ctx.cfg.universe.scanEnabled || ctx.cfg.universe.maxExplored === 0) {
@@ -133,14 +138,14 @@ export class Explorer extends Agent {
     await this.refreshTradable(notes);
 
     const crypto = this.ctx.feed.cryptoProvider();
-    if (crypto instanceof BinanceProvider) {
+    if (crypto && 'fetchTickers24h' in crypto) {
       try {
-        candidates.push(...(await this.scanCrypto(crypto)));
+        candidates.push(...(await this.scanCrypto(crypto as TickerSource)));
       } catch (err) {
         notes.push(`crypto scan failed (${(err as Error).message.slice(0, 60)})`);
       }
     } else {
-      notes.push('crypto scan needs Binance data');
+      notes.push('crypto scan needs Binance or OKX data');
     }
     if (cfg.scanStocks && this.alpaca) {
       try {
@@ -152,6 +157,7 @@ export class Explorer extends Agent {
 
     this.dropStale();
 
+    await this.vet(candidates, notes);
     candidates.sort((a, b) => b.score - a.score);
     const good = candidates.filter((c) => c.score >= 0.45);
     // Crypto first: it trades 24/7 and is where the overlooked small caps are. Stocks only
@@ -198,7 +204,7 @@ export class Explorer extends Agent {
 
   // --- Crypto -------------------------------------------------------------------
 
-  private async scanCrypto(p: BinanceProvider): Promise<Candidate[]> {
+  private async scanCrypto(p: TickerSource): Promise<Candidate[]> {
     const cfg = this.ctx.cfg;
     const u = cfg.universe;
     const tickers = await p.fetchTickers24h();
@@ -254,20 +260,50 @@ export class Explorer extends Agent {
     return out;
   }
 
-  /** With Alpaca as the venue, an idea is worthless if Alpaca cannot trade it. Refreshed twice a day. */
+  /**
+   * Look the best few crypto candidates up in the coin database before adding them. Coins with a
+   * hard red flag (almost all supply still locked, absurd fully diluted value) are dropped; softer
+   * flags lower the score and are shown next to the coin in the UI.
+   */
+  private async vet(candidates: Candidate[], notes: string[]): Promise<void> {
+    const top = candidates
+      .filter((c) => c.asset === 'crypto' && c.score >= 0.45)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+    let dropped = 0;
+    for (const c of top) {
+      const d = await this.ctx.intel.lookup(c.symbol);
+      if (!d) continue;
+      if (d.flags.hard.length) {
+        c.score = -1;
+        dropped++;
+        continue;
+      }
+      c.score -= 0.1 * d.flags.soft.length;
+      if (d.flags.soft.length) c.reason += ` | watch: ${d.flags.soft.slice(0, 2).join('; ')}`;
+    }
+    if (dropped) notes.push(`${dropped} dropped on red flags`);
+  }
+
+  /** An idea is worthless if the execution venue cannot trade it. Refreshed twice a day. */
   private async refreshTradable(notes: string[]): Promise<void> {
-    if (this.ctx.cfg.execution !== 'alpaca' || !this.alpaca) return;
+    const venue = this.ctx.cfg.execution;
+    if (venue === 'paper') return;
     if (this.tradable && Date.now() - this.tradableAt < 12 * 3_600_000) return;
     try {
-      const got = await this.alpaca.tradableAssets();
-      if (got.crypto.size === 0 || got.stocks.size === 0) throw new Error('empty asset list');
-      this.tradable = got;
+      if (venue === 'okx' && this.okx) {
+        this.tradable = { crypto: this.okx.tradableBases(), stocks: new Set() };
+      } else if (venue === 'alpaca' && this.alpaca) {
+        const got = await this.alpaca.tradableAssets();
+        if (got.crypto.size === 0 || got.stocks.size === 0) throw new Error('empty asset list');
+        this.tradable = got;
+      }
       this.tradableAt = Date.now();
-      log.info(`alpaca can trade ${this.tradable.crypto.size} crypto and ${this.tradable.stocks.size} stocks`);
+      if (this.tradable) log.info(`${venue} can trade ${this.tradable.crypto.size} crypto and ${this.tradable.stocks.size} stocks`);
     } catch (err) {
       notes.push(`asset list failed (${(err as Error).message.slice(0, 50)})`);
     }
-    if (!this.tradable) throw new Error('cannot confirm what Alpaca can trade; skipping this scan');
+    if (!this.tradable) throw new Error(`cannot confirm what ${venue} can trade; skipping this scan`);
   }
 
   /** Market caps change slowly; refresh a few times a day. A failure keeps the old table. */

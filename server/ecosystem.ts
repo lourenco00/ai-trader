@@ -19,11 +19,13 @@ import { Strategist } from './agents/strategist';
 import { Reporter, Scout, Treasurer } from './agents/support';
 import { Trader } from './agents/trader';
 import { AlpacaBroker, AlpacaClient } from './broker/alpaca';
+import { OkxBroker, OkxClient } from './broker/okx';
 import { PaperBroker, type Broker } from './broker/broker';
 import type { Config } from './config';
 import { achievementList, ACHIEVEMENTS, graduation } from './gamification';
 import { LlmClient } from './llm/client';
 import { freshCost, LlmBudget, type LlmCostState } from './llm/budget';
+import { CoinIntel } from './market/intel';
 import { MarketFeed } from './market/feed';
 import { Universe, type UniverseSave } from './market/universe';
 import { NEWS_ANCHORS, RESEARCHERS, STAFF, TRADERS } from './roster';
@@ -104,6 +106,7 @@ function freshFund(capital: number): FundState {
 export class Ecosystem implements EcoContext {
   readonly feed: MarketFeed;
   readonly universe: Universe;
+  readonly intel: CoinIntel;
   readonly broker: Broker;
   readonly vault: StrategyVault;
   readonly fund: FundView;
@@ -111,6 +114,7 @@ export class Ecosystem implements EcoContext {
   readonly llm: LlmClient;
 
   private alpaca: AlpacaClient | null = null;
+  private okx: OkxClient | null = null;
   private fundState: FundState;
   private llmBudget: LlmBudget;
   private llmCost: LlmCostState;
@@ -130,6 +134,8 @@ export class Ecosystem implements EcoContext {
   private stockMarketOpen = true;
   private capital: number;
   private lastBrokerCheck = 0;
+  /** Latest figures from the Alpaca account itself, to compare against the ledger. */
+  private brokerAcct: { equity: number; cash: number; at: number } | null = null;
 
   private trades: TradeDTO[] = [];
   private newsItems: NewsItem[] = [];
@@ -150,8 +156,15 @@ export class Ecosystem implements EcoContext {
   constructor(readonly cfg: Config) {
     if (cfg.execution === 'alpaca' || cfg.provider === 'alpaca' || cfg.universe.scanStocks) this.alpaca = new AlpacaClient(cfg);
     this.universe = new Universe(cfg);
+    this.intel = new CoinIntel(cfg);
     this.feed = new MarketFeed(cfg, this.alpaca);
-    this.broker = cfg.execution === 'alpaca' && this.alpaca ? new AlpacaBroker(this.alpaca) : new PaperBroker(cfg.feeRate, cfg.slippage, (s) => this.universe.slippage(s));
+    if (cfg.execution === 'okx') this.okx = new OkxClient(cfg);
+    this.broker =
+      cfg.execution === 'alpaca' && this.alpaca
+        ? new AlpacaBroker(this.alpaca)
+        : cfg.execution === 'okx' && this.okx
+          ? new OkxBroker(this.okx, cfg)
+          : new PaperBroker(cfg.feeRate, cfg.slippage, (s) => this.universe.slippage(s));
     this.vault = new StrategyVault(cfg.research.vaultCapacity);
     this.capital = cfg.startingCapital;
     this.fundState = freshFund(this.capital);
@@ -209,6 +222,7 @@ export class Ecosystem implements EcoContext {
       log.info(`restored season from ${new Date(saved.savedAt).toISOString()} (${this.vault.all().length} strategies)`);
     }
 
+    if (this.okx) await this.okx.init();
     if (!saved && this.cfg.execution === 'alpaca' && this.alpaca) await this.fundFromAlpaca();
     const savedExplored = this.universe.restoreFacts(saved?.universe);
     await this.feed.start();
@@ -255,7 +269,7 @@ export class Ecosystem implements EcoContext {
     });
     this.commander = new Commander(this, STAFF.commander.id, STAFF.commander.name, STAFF.commander.look, this.traders, this.fundState);
     this.scout = new Scout(this, STAFF.scout.id, STAFF.scout.name, STAFF.scout.look);
-    this.explorer = new Explorer(this, STAFF.explorer.id, STAFF.explorer.name, STAFF.explorer.look, this.alpaca);
+    this.explorer = new Explorer(this, STAFF.explorer.id, STAFF.explorer.name, STAFF.explorer.look, this.alpaca, this.okx);
     this.universe.onChange((c) => this.onUniverseChange(c));
     this.reporter = new Reporter(this, STAFF.reporter.id, STAFF.reporter.name, STAFF.reporter.look);
     this.treasurer = new Treasurer(this, STAFF.treasurer.id, STAFF.treasurer.name, STAFF.treasurer.look);
@@ -280,23 +294,36 @@ export class Ecosystem implements EcoContext {
   }
 
   /**
-   * With Alpaca as the venue the money comes from the Alpaca paper account: the fund starts
-   * with the account's cash, capped by STARTING_CAPITAL so the agents use a slice of it.
+   * With Alpaca as the venue the Alpaca paper account is the fund: it starts with the
+   * account's cash (optionally capped by ALPACA_CAPITAL_CAP), so the numbers match Alpaca's.
    */
   private async fundFromAlpaca(): Promise<void> {
     const acct = await this.alpaca!.account();
     if (acct.status !== 'ACTIVE') throw new Error(`Alpaca account is ${acct.status}, not ACTIVE`);
-    this.capital = Math.floor(Math.min(acct.cash, this.cfg.startingCapital));
+    const cap = this.cfg.alpacaCapitalCap > 0 ? this.cfg.alpacaCapitalCap : Infinity;
+    this.capital = Math.floor(Math.min(acct.cash, cap));
     if (!(this.capital >= 100)) throw new Error(`Alpaca paper account has only $${acct.cash.toFixed(2)} cash`);
     this.fundState = freshFund(this.capital);
     const held = await this.alpaca!.positions().catch(() => []);
     log.info(`funded from Alpaca paper account: $${this.capital} of $${acct.cash.toFixed(2)} cash${held.length ? `; account already holds ${held.map((p) => p.symbol).join(', ')} (not managed by the agents)` : ''}`);
   }
 
-  /** Every few minutes, check that what the ledger thinks it holds is what Alpaca holds. */
+  /** Every minute pull the real account figures; every few minutes check positions agree too. */
   private async checkBroker(): Promise<void> {
-    if (this.cfg.execution !== 'alpaca' || !this.alpaca || Date.now() - this.lastBrokerCheck < 5 * 60_000) return;
+    if (this.cfg.execution !== 'alpaca' || !this.alpaca || Date.now() - this.lastBrokerCheck < 60_000) return;
     this.lastBrokerCheck = Date.now();
+    try {
+      const acct = await this.alpaca.account();
+      const prev = this.brokerAcct;
+      this.brokerAcct = { equity: acct.equity, cash: acct.cash, at: Date.now() };
+      const gap = this.fundEquity() / acct.equity - 1;
+      // Report once when the ledger drifts from the account, and once when it recovers.
+      if (Math.abs(gap) > 0.01 && !(prev && Math.abs(this.fundEquity() / prev.equity - 1) > 0.01)) {
+        this.news('risk', `Ledger $${this.fundEquity().toFixed(2)} differs from Alpaca $${acct.equity.toFixed(2)} by ${(gap * 100).toFixed(2)}%`, { good: false });
+      }
+    } catch (err) {
+      log.debug('account check failed', err);
+    }
     try {
       const real = new Map((await this.alpaca.positions()).map((p) => [p.symbol, p.marketValue]));
       for (const t of this.traders) {
@@ -733,7 +760,8 @@ export class Ecosystem implements EcoContext {
       serverTime: Date.now(),
       seasonStartedAt: this.seasonStartedAt,
       mode: 'paper',
-      execution: this.cfg.execution === 'alpaca' ? 'alpaca' : 'local',
+      execution: this.cfg.execution === 'alpaca' ? 'alpaca' : this.cfg.execution === 'okx' ? 'okx' : 'local',
+      broker: this.brokerAcct ? { equity: this.brokerAcct.equity, cash: this.brokerAcct.cash, updatedAt: this.brokerAcct.at, gap: eq / this.brokerAcct.equity - 1 } : null,
       provider: this.feed.provider.name,
       timeframe: this.cfg.timeframe,
       llmEnabled: this.cfg.llm.enabled,

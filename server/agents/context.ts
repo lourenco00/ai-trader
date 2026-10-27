@@ -3,6 +3,7 @@ import type { Broker } from '../broker/broker';
 import type { Config } from '../config';
 import type { LlmClient } from '../llm/client';
 import type { MarketFeed } from '../market/feed';
+import type { CoinIntel } from '../market/intel';
 import type { Universe } from '../market/universe';
 import type { SignalBoard } from '../signals/board';
 import type { IndicatorCache } from '../strategy/indicators';
@@ -44,6 +45,7 @@ export interface EcoContext {
   readonly cfg: Config;
   readonly feed: MarketFeed;
   readonly universe: Universe;
+  readonly intel: CoinIntel;
   readonly broker: Broker;
   readonly vault: StrategyVault;
   readonly risk: RiskGate;

@@ -132,6 +132,105 @@ export class BinanceProvider implements MarketDataProvider {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// OKX (public market data, no key needed). Uses the EU endpoint by default and the
+// USDC pairs, because those are what an EU account can actually trade; the USDT
+// pairs that dominate OKX's volume are closed to EU residents.
+// ---------------------------------------------------------------------------
+
+const OKX_BARS: Record<number, string> = { 300_000: '5m', 900_000: '15m', 3_600_000: '1H' };
+
+export class OkxProvider implements MarketDataProvider {
+  readonly name = 'okx';
+  private base = process.env.OKX_BASE_URL?.trim() || 'https://eea.okx.com';
+
+  constructor(private quote = process.env.OKX_QUOTE?.trim() || 'USDC') {}
+
+  private inst(symbol: string): string {
+    return `${symbol}-${this.quote}`;
+  }
+
+  private bar(intervalMs: number): string {
+    const b = OKX_BARS[intervalMs];
+    if (!b) throw new Error(`okx: unsupported interval ${intervalMs}`);
+    return b;
+  }
+
+  private async data(path: string): Promise<unknown[]> {
+    const j = (await fetchJson(`${this.base}${path}`, 15_000)) as { code?: string; msg?: string; data?: unknown[] };
+    if (j.code !== '0' || !Array.isArray(j.data)) throw new Error(`okx ${path.split('?')[0]} -> ${j.code} ${j.msg ?? ''}`);
+    return j.data;
+  }
+
+  /** OKX rows: [ts, open, high, low, close, volume(base), volCcy, volCcyQuote, confirm], newest first. */
+  private parse(rows: unknown[]): Candle[] {
+    return rows
+      .map((r) => {
+        const row = r as string[];
+        return {
+          t: finite(Number(row[0]), 'time'),
+          o: finite(Number(row[1]), 'open'),
+          h: finite(Number(row[2]), 'high'),
+          l: finite(Number(row[3]), 'low'),
+          c: finite(Number(row[4]), 'close'),
+          v: finite(Number(row[5]), 'volume'),
+        };
+      })
+      .sort((a, b) => a.t - b.t);
+  }
+
+  async fetchHistory(symbol: string, intervalMs: number, bars: number): Promise<Candle[]> {
+    const out: Candle[] = [];
+    let before: number | undefined;
+    while (out.length < bars) {
+      const q = `/api/v5/market/history-candles?instId=${this.inst(symbol)}&bar=${this.bar(intervalMs)}&limit=100${before !== undefined ? `&after=${before}` : ''}`;
+      const page = this.parse(await this.data(q));
+      if (page.length === 0) break;
+      out.unshift(...page);
+      before = page[0].t;
+      await sleep(120);
+    }
+    // The newest page may still hold the bar in progress; later stages drop unclosed bars.
+    const recent = this.parse(await this.data(`/api/v5/market/candles?instId=${this.inst(symbol)}&bar=${this.bar(intervalMs)}&limit=5`));
+    return dedupe([...out, ...recent]).slice(-bars);
+  }
+
+  async fetchRecent(symbol: string, intervalMs: number, n: number): Promise<Candle[]> {
+    return this.parse(await this.data(`/api/v5/market/candles?instId=${this.inst(symbol)}&bar=${this.bar(intervalMs)}&limit=${Math.min(300, n)}`));
+  }
+
+  private async tickers(): Promise<Record<string, string>[]> {
+    return (await this.data('/api/v5/market/tickers?instType=SPOT')) as Record<string, string>[];
+  }
+
+  async fetchPrices(symbols: string[]): Promise<Record<string, number>> {
+    const want = new Map(symbols.map((s) => [this.inst(s), s]));
+    const out: Record<string, number> = {};
+    for (const t of await this.tickers()) {
+      const sym = want.get(t.instId);
+      if (sym) out[sym] = finite(Number(t.last), 'price');
+    }
+    return out;
+  }
+
+  /** 24h stats for every pair in our quote currency, in one request. Used by the Explorer. */
+  async fetchTickers24h(): Promise<Ticker24h[]> {
+    const suffix = `-${this.quote}`;
+    const out: Ticker24h[] = [];
+    for (const t of await this.tickers()) {
+      if (!t.instId.endsWith(suffix)) continue;
+      const last = Number(t.last);
+      const open = Number(t.open24h);
+      const quoteVolume = Number(t.volCcy24h);
+      if (!(last > 0) || !Number.isFinite(quoteVolume)) continue;
+      // The ticker has no trade count; volume alone gates liquidity here.
+      out.push({ base: t.instId.slice(0, -suffix.length), quoteVolume, lastPrice: last, change24h: open > 0 ? last / open - 1 : 0, trades: 1e9 });
+    }
+    return out;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Coinbase Exchange (public, no key needed)
 // ---------------------------------------------------------------------------

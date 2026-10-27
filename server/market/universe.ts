@@ -42,6 +42,7 @@ export class Universe {
   private explored = new Map<string, ExploredEntry>();
   private stats = new Map<string, Stats>();
   private listeners: UniverseListener[] = [];
+  private looks = new Map<string, number[]>();
 
   constructor(private cfg: Config) {}
 
@@ -146,7 +147,7 @@ export class Universe {
    */
   shortable(symbol: string): boolean {
     // Alpaca cannot short crypto at all.
-    if (this.cfg.execution === 'alpaca' && this.cfg.assetClass(symbol) === 'crypto') return false;
+    if (this.cfg.execution !== 'paper' && this.cfg.assetClass(symbol) === 'crypto') return false;
     return this.cfg.isCore(symbol);
   }
 
@@ -161,10 +162,27 @@ export class Universe {
 
   /** Per-side fee as a fraction, matching what the execution venue really charges. */
   feeRate(symbol: string): number {
+    if (this.cfg.execution === 'okx') {
+      const { makerFee, takerFee } = this.cfg.okx;
+      return this.cfg.limitOrders ? (makerFee + takerFee) / 2 + 0.0002 : takerFee;
+    }
     if (this.cfg.execution !== 'alpaca') return this.cfg.feeRate;
     if (this.cfg.assetClass(symbol) !== 'crypto') return 0;
     // Entries and calm exits go out as limit orders when they can; stops always pay the taker fee.
     return this.cfg.limitOrders ? (this.cfg.alpacaCryptoFee + this.cfg.alpacaCryptoMakerFee) / 2 + 0.0002 : this.cfg.alpacaCryptoFee;
+  }
+
+  /**
+   * Records one more strategy being judged on a market's holdout and returns how many were judged in
+   * the last 7 days. Testing many strategies and keeping the best guarantees some look good by luck,
+   * so the promotion gate raises its bar with this count.
+   */
+  noteLook(symbol: string): number {
+    const now = Date.now();
+    const list = (this.looks.get(symbol) ?? []).filter((t) => now - t < 7 * 86_400_000);
+    list.push(now);
+    this.looks.set(symbol, list);
+    return list.length;
   }
 
   // --- Research scheduling -----------------------------------------------------

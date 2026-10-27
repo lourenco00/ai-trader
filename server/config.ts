@@ -30,9 +30,9 @@ if (timeframeMs === undefined) {
   throw new Error(`config: TIMEFRAME must be one of ${Object.keys(TIMEFRAMES).join(', ')}`);
 }
 
-const provider = (env.DATA_PROVIDER?.trim() || 'auto') as 'auto' | 'binance' | 'coinbase' | 'alpaca' | 'sim';
-if (!['auto', 'binance', 'coinbase', 'alpaca', 'sim'].includes(provider)) {
-  throw new Error('config: DATA_PROVIDER must be auto, binance, coinbase, alpaca or sim');
+const provider = (env.DATA_PROVIDER?.trim() || 'auto') as 'auto' | 'binance' | 'okx' | 'coinbase' | 'alpaca' | 'sim';
+if (!['auto', 'binance', 'okx', 'coinbase', 'alpaca', 'sim'].includes(provider)) {
+  throw new Error('config: DATA_PROVIDER must be auto, binance, okx, coinbase, alpaca or sim');
 }
 
 export type AssetClass = 'crypto' | 'stock';
@@ -81,8 +81,16 @@ const alpacaKey = env.ALPACA_KEY_ID?.trim() || '';
 const alpacaSecret = env.ALPACA_SECRET?.trim() || '';
 const alpacaPaper = bool('ALPACA_PAPER', true);
 const hasAlpacaKeys = alpacaKey !== '' && alpacaSecret !== '';
-const execMode = (env.EXECUTION?.trim().toLowerCase() || 'paper') as 'paper' | 'alpaca';
-if (!['paper', 'alpaca'].includes(execMode)) throw new Error('config: EXECUTION must be paper or alpaca');
+const okxKey = env.OKX_API_KEY?.trim() || '';
+const okxSecret = env.OKX_API_SECRET?.trim() || '';
+const okxPass = env.OKX_API_PASSPHRASE?.trim() || '';
+const okxDemo = bool('OKX_DEMO', true);
+const execMode = (env.EXECUTION?.trim().toLowerCase() || 'paper') as 'paper' | 'alpaca' | 'okx';
+if (!['paper', 'alpaca', 'okx'].includes(execMode)) throw new Error('config: EXECUTION must be paper, alpaca or okx');
+if (execMode === 'okx') {
+  if (!okxDemo) throw new Error('config: EXECUTION=okx requires OKX_DEMO=true. Live trading is deliberately disabled in this build.');
+  if (!okxKey || !okxSecret || !okxPass) throw new Error('config: EXECUTION=okx needs OKX_API_KEY, OKX_API_SECRET and OKX_API_PASSPHRASE');
+}
 if (execMode === 'alpaca' && !alpacaPaper) {
   throw new Error('config: EXECUTION=alpaca requires ALPACA_PAPER=true. Live trading is deliberately disabled in this build.');
 }
@@ -95,7 +103,10 @@ export const config = {
   host: env.HOST?.trim() || '127.0.0.1',
   dataDir: path.resolve(env.DATA_DIR?.trim() || './data'),
 
+  // With EXECUTION=alpaca the Alpaca account is the fund and this is ignored (see ALPACA_CAPITAL_CAP).
   startingCapital: num('STARTING_CAPITAL', 10_000, 100, 1e9),
+  /** Optional ceiling on how much of the Alpaca account the agents may use. 0 = the whole account. */
+  alpacaCapitalCap: num('ALPACA_CAPITAL_CAP', 0, 0, 1e9),
   symbols,
   symbolSpecs,
   /** Symbols from SYMBOLS in .env. The Explorer never removes these. */
@@ -168,7 +179,8 @@ export const config = {
     populationSize: 32,
     generationsPerEpoch: 10,
     restBetweenEpochsMs: 8_000,
-    trainFraction: 0.7,
+    // 40% of history is held out (about 5 months on hourly bars), up from 30%: a longer exam is harder to get lucky on.
+    trainFraction: 0.6,
     promotion: {
       minTrainTrades: 30,
       minTrainSharpe: 0.3,
@@ -177,6 +189,12 @@ export const config = {
       minTestReturn: 0.002,
       maxTestDrawdown: 0.2,
       minProfitFactor: 1.05,
+      // The holdout is split in two. A strategy must trade and earn in BOTH halves, so one lucky
+      // stretch cannot carry it.
+      minHalfTrades: 2,
+      // Every strategy tested on a market's holdout is another lottery ticket. The Sharpe needed
+      // rises with how many were tried in the last 7 days, up to this ceiling.
+      maxRequiredSharpe: 2.0,
     },
     vaultCapacity: 30,
   },
@@ -234,6 +252,14 @@ export const config = {
     minBars: 1000,
   },
 
+  /** Coin facts (CoinGecko, DEX Screener). A free CoinGecko demo key raises the rate limit from ~5 to 30 calls a minute. */
+  intel: {
+    coingeckoKey: env.COINGECKO_API_KEY?.trim() || '',
+    /** A paid CoinGecko plan: a different host and header, and a much higher rate limit. */
+    coingeckoProKey: env.COINGECKO_PRO_KEY?.trim() || '',
+    minGapMs: env.COINGECKO_PRO_KEY?.trim() ? 300 : env.COINGECKO_API_KEY?.trim() ? 2_500 : 7_000,
+  },
+
   news: {
     enabled: llmEnabled && bool('NEWS_ENABLED', true),
     pollMs: num('NEWS_POLL_MIN', 8, 2, 240) * 60_000,
@@ -255,6 +281,18 @@ export const config = {
   },
 
   execution: execMode,
+
+  okx: {
+    keyId: okxKey,
+    secret: okxSecret,
+    passphrase: okxPass,
+    demo: okxDemo,
+    baseUrl: (env.OKX_BASE_URL?.trim() || 'https://eea.okx.com').replace(/\/$/, ''),
+    quote: env.OKX_QUOTE?.trim() || 'USDC',
+    // Lowest EU tier as read from the account's fee endpoint; used for research costs.
+    makerFee: 0.002,
+    takerFee: 0.0035,
+  },
 } as const;
 
 export type Config = typeof config;

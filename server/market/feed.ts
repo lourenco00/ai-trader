@@ -2,7 +2,7 @@ import type { Candle } from '../../shared/types';
 import { AlpacaProvider, type AlpacaClient } from '../broker/alpaca';
 import type { Config } from '../config';
 import { logger } from '../util/log';
-import { BinanceProvider, CoinbaseProvider, SimulatedProvider, type MarketDataProvider } from './providers';
+import { BinanceProvider, CoinbaseProvider, OkxProvider, SimulatedProvider, type MarketDataProvider } from './providers';
 
 const log = logger('feed');
 
@@ -140,6 +140,8 @@ export class MarketFeed {
     switch (this.cfg.provider) {
       case 'binance':
         return [new BinanceProvider()];
+      case 'okx':
+        return [new OkxProvider()];
       case 'coinbase':
         return [new CoinbaseProvider()];
       case 'alpaca':
