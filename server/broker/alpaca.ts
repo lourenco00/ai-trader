@@ -214,6 +214,10 @@ export class AlpacaClient {
   async submitOrder(req: OrderRequest): Promise<Fill> {
     const isCrypto = this.cfg.assetClass(req.symbol) === 'crypto';
     const apiSymbol = isCrypto ? this.cryptoPair(req.symbol) : req.symbol;
+    if (isCrypto && this.cfg.limitOrders && !(req.closing && req.urgent)) {
+      const resting = await this.restingCryptoOrder(req, apiSymbol);
+      if (resting) return resting;
+    }
     let r;
     if (req.closing) {
       // The positions endpoint names crypto without the slash (ETHUSD).
@@ -235,6 +239,138 @@ export class AlpacaClient {
     }
     const order = r.json as { id: string };
     return this.awaitFill(order.id, req, isCrypto);
+  }
+
+  // --- Limit orders (crypto) ----------------------------------------------------
+
+  private async quote(apiSymbol: string): Promise<{ bid: number; ask: number } | null> {
+    const base = this.cfg.alpaca.dataUrl.replace(/\/$/, '');
+    try {
+      const body = (await this.getJson(`${base}/v1beta3/crypto/us/latest/quotes?symbols=${encodeURIComponent(apiSymbol)}`)) as { quotes?: Record<string, { bp: number; ap: number }> };
+      const q = body.quotes?.[apiSymbol];
+      if (q && q.bp > 0 && q.ap > 0 && q.ap >= q.bp) return { bid: q.bp, ask: q.ap };
+    } catch (err) {
+      log.debug(`quote ${apiSymbol} failed`, err);
+    }
+    return null;
+  }
+
+  private tickCache = new Map<string, number>();
+
+  /** Smallest price step the venue accepts for this pair. */
+  private async priceIncrement(apiSymbol: string): Promise<number> {
+    const hit = this.tickCache.get(apiSymbol);
+    if (hit) return hit;
+    const r = await this.send('GET', `/v2/assets/${encodeURIComponent(apiSymbol)}`);
+    const inc = Number((r.json as { price_increment?: string | number })?.price_increment);
+    const tick = Number.isFinite(inc) && inc > 0 ? inc : 1e-6;
+    this.tickCache.set(apiSymbol, tick);
+    return tick;
+  }
+
+  private roundToTick(price: number, tick: number, mode: 'down' | 'up'): number {
+    const n = (mode === 'down' ? Math.floor : Math.ceil)(price / tick + 1e-9);
+    const decimals = Math.max(0, Math.round(-Math.log10(tick)));
+    return Number((n * tick).toFixed(Math.min(decimals + 1, 10)));
+  }
+
+  private async readOrder(id: string): Promise<{ status: string; qty: number; avg: number }> {
+    const r = await this.send('GET', `/v2/orders/${id}`);
+    const o = r.json as { status?: string; filled_qty?: string; filled_avg_price?: string };
+    return { status: o.status ?? 'unknown', qty: Number(o.filled_qty) || 0, avg: Number(o.filled_avg_price) || 0 };
+  }
+
+  /** Wait until the order is filled or the time is up, then cancel whatever is still resting. */
+  private async restUntil(id: string, waitMs: number): Promise<{ qty: number; avg: number }> {
+    const terminal = ['filled', 'canceled', 'rejected', 'expired'];
+    const end = Date.now() + waitMs;
+    let o = await this.readOrder(id);
+    while (!terminal.includes(o.status) && Date.now() < end) {
+      await new Promise((res) => setTimeout(res, 2000));
+      o = await this.readOrder(id);
+    }
+    if (!terminal.includes(o.status)) {
+      await this.send('DELETE', `/v2/orders/${id}`);
+      // The order can fill in the instant before the cancel lands, so read the final state.
+      for (let i = 0; i < 5; i++) {
+        await new Promise((res) => setTimeout(res, 400));
+        o = await this.readOrder(id);
+        if (terminal.includes(o.status)) break;
+      }
+    }
+    return { qty: o.qty, avg: o.avg };
+  }
+
+  /**
+   * Crypto entry or calm exit as a limit order inside the spread, so it is a maker order
+   * (0.15% instead of 0.25%). Returns null to fall back to a market order.
+   */
+  private async restingCryptoOrder(req: OrderRequest, apiSymbol: string): Promise<Fill | null> {
+    const q = await this.quote(apiSymbol);
+    if (!q) return null;
+    const mid = (q.bid + q.ask) / 2;
+    const spread = (q.ask - q.bid) / mid;
+    if (spread > 0.01) {
+      if (req.closing) return null; // get out at market rather than wait on a 1%-wide book
+      throw new Error(`${req.symbol} spread too wide (${(spread * 100).toFixed(2)}%)`);
+    }
+    const tick = await this.priceIncrement(apiSymbol);
+    const buy = req.side === 'buy';
+    // 30% of the way across the spread from our own side: inside the book, never crossing it.
+    const raw = buy ? q.bid + 0.3 * (q.ask - q.bid) : q.ask - 0.3 * (q.ask - q.bid);
+    const price = this.roundToTick(raw, tick, buy ? 'down' : 'up');
+    if (!(price > 0)) return null;
+
+    let qty = req.qty;
+    if (req.closing) {
+      const pos = await this.send('GET', `/v2/positions/${apiSymbol.replace('/', '')}`);
+      const held = Number((pos.json as { qty_available?: string })?.qty_available);
+      if (pos.status === 404 || !(held > 0)) throw new Error(`alpaca holds no ${apiSymbol} position to close`);
+      qty = held;
+    }
+    const qtyStr = qty.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+    const r = await this.send('POST', '/v2/orders', { symbol: apiSymbol, side: req.side, type: 'limit', limit_price: String(price), time_in_force: 'gtc', qty: qtyStr });
+    if (r.status >= 300) throw this.orderError(`limit ${req.side} ${apiSymbol}`, r);
+    const id = (r.json as { id: string }).id;
+    const got = await this.restUntil(id, req.closing ? this.cfg.limitExitWaitMs : this.cfg.limitEntryWaitMs);
+    const maker = this.cfg.alpacaCryptoMakerFee;
+    log.info(`limit ${req.side} ${apiSymbol} @ ${price}: filled ${got.qty} of ${qtyStr}`);
+
+    // Whatever did not rest-fill goes out at market, so an entry is never lost to a price that ran away
+    // and an exit always fully closes. The delay is seconds against hourly candles.
+    const rest = qty - got.qty;
+    if (rest <= qty * 0.001) {
+      return { symbol: req.symbol, side: req.side, qty: got.qty, price: got.avg, fee: got.avg * got.qty * maker, time: Date.now() };
+    }
+    let tail: Fill;
+    if (req.closing) {
+      const closed = await this.send('DELETE', `/v2/positions/${apiSymbol.replace('/', '')}`);
+      if (closed.status === 404) {
+        // Filled in the meantime; treat what we know as the exit.
+        return { symbol: req.symbol, side: req.side, qty: got.qty, price: got.avg || req.refPrice, fee: got.avg * got.qty * maker, time: Date.now() };
+      }
+      if (closed.status >= 300) throw this.orderError(`close ${apiSymbol}`, closed);
+      tail = await this.awaitFill((closed.json as { id: string }).id, { ...req, qty: rest }, true);
+    } else {
+      const m = await this.send('POST', '/v2/orders', {
+        symbol: apiSymbol,
+        side: req.side,
+        type: 'market',
+        time_in_force: 'gtc',
+        qty: rest.toFixed(8).replace(/0+$/, '').replace(/.$/, ''),
+      });
+      if (m.status >= 300) throw this.orderError(`${req.side} ${apiSymbol}`, m);
+      tail = await this.awaitFill((m.json as { id: string }).id, { ...req, qty: rest }, true);
+    }
+    const total = got.qty + tail.qty;
+    return {
+      symbol: req.symbol,
+      side: req.side,
+      qty: total,
+      price: (got.avg * got.qty + tail.price * tail.qty) / total,
+      fee: got.avg * got.qty * maker + tail.fee,
+      time: Date.now(),
+    };
   }
 
   private async awaitFill(id: string, req: OrderRequest, isCrypto: boolean): Promise<Fill> {

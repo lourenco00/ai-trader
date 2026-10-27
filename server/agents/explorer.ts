@@ -157,14 +157,14 @@ export class Explorer extends Agent {
     // Crypto first: it trades 24/7 and is where the overlooked small caps are. Stocks only
     // get a seat while their share of the map is small, one per scan.
     const ordered = [...good.filter((c) => c.asset === 'crypto'), ...good.filter((c) => c.asset === 'stock')];
-    // Alpaca's crypto list is short, so with it as the venue stocks get up to half the map.
-    const stockCap = Math.max(1, Math.ceil(cfg.maxExplored / (this.ctx.cfg.execution === 'alpaca' ? 2 : 3)));
+    // Stocks are a small minority of the map (crypto is the focus), one per scan.
+    const stockCap = Math.max(1, Math.ceil(cfg.maxExplored / 5));
     let added = 0;
     let stocksAdded = 0;
     let attempts = 0;
     for (const c of ordered) {
       if (added >= cfg.addPerScan || attempts >= cfg.addPerScan + 4) break;
-      if (c.asset === 'stock' && (stocksAdded >= (this.ctx.cfg.execution === 'alpaca' ? 2 : 1) || universe.exploredEntries().filter((e) => e.asset === 'stock').length >= stockCap)) continue;
+      if (c.asset === 'stock' && (stocksAdded >= 1 || universe.exploredEntries().filter((e) => e.asset === 'stock').length >= stockCap)) continue;
       if (universe.exploredCount() >= cfg.maxExplored && !this.makeRoom()) break;
       attempts++;
       const why = await this.ctx.feed.addSymbol(c.symbol, c.asset, cfg.minBars);
@@ -240,7 +240,8 @@ export class Explorer extends Agent {
       if (!a || a.annVol > 5 || a.annVol < 0.15) continue;
       const score =
         0.45 * clamp(Math.log2(Math.max(a.surge, 0.01)), -1, 3) +
-        0.35 * clamp(Math.abs(a.week) / 0.25, 0, 2) +
+        // Long-only venue: a rising coin is worth more attention than a falling one.
+        0.35 * clamp((a.week >= 0 ? a.week : a.week * 0.4) / 0.25, 0, 2) +
         0.2 * clamp(a.annVol / 1.5, 0, 2);
       out.push({
         symbol: t.base,

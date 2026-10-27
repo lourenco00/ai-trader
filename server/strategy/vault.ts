@@ -108,10 +108,10 @@ export class StrategyVault {
    * Best waiting strategy, preferring coins that are not crowded yet. No coin
    * gets more than `maxPerSymbol` traders, so one market can't dominate the floor.
    */
-  bestAvailable(activeSymbols: string[], maxPerSymbol: number): StrategyRecord | undefined {
+  bestAvailable(activeSymbols: string[], maxPerSymbol: number, isOpen: (symbol: string) => boolean = () => true): StrategyRecord | undefined {
     const counts = new Map<string, number>();
     for (const s of activeSymbols) counts.set(s, (counts.get(s) ?? 0) + 1);
-    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol);
+    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol && isOpen(s.symbol));
     if (!waiting.length) return undefined;
     return waiting
       .map((s) => ({ s, score: s.fitness - 0.5 * (counts.get(s.symbol) ?? 0) }))

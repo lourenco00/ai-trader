@@ -126,8 +126,13 @@ export const config = {
   pollMs: num('POLL_MS', 10_000, 3000, 120_000),
 
   feeRate: num('FEE_RATE', 0.001, 0, 0.01),
-  /** Alpaca charges crypto takers about 0.25% (taken in kind) and US stocks nothing. */
+  /** Alpaca's first crypto tier: takers pay 0.25%, makers 0.15% (taken in kind). US stocks are free. */
   alpacaCryptoFee: 0.0025,
+  alpacaCryptoMakerFee: 0.0015,
+  /** Post limit orders inside the spread for crypto entries and calm exits, to earn the maker fee. */
+  limitOrders: bool('LIMIT_ORDERS', true),
+  limitEntryWaitMs: num('LIMIT_ENTRY_WAIT_SEC', 90, 10, 600) * 1000,
+  limitExitWaitMs: num('LIMIT_EXIT_WAIT_SEC', 60, 10, 600) * 1000,
   slippage: num('SLIPPAGE_BPS', 3, 0, 100) / 10_000,
 
   researchers: Math.round(num('RESEARCHERS', 4, 1, 8)),
@@ -218,6 +223,8 @@ export const config = {
     // and the dust at the bottom. If CoinGecko is unreachable the scan falls back to volume alone.
     skipTopRank: Math.round(num('SCAN_SKIP_TOP_RANK', 50, 0, 500)),
     minMarketCapUsd: num('SCAN_MIN_MCAP_USD', 10_000_000, 0, 1e12),
+    /** Share of research epochs spent on crypto when both crypto and stocks are on the map. */
+    cryptoFocus: num('RESEARCH_CRYPTO_SHARE', 0.75, 0, 1),
     scanStocks: bool('SCAN_STOCKS', hasAlpacaKeys) && hasAlpacaKeys,
     stockMinPrice: num('SCAN_STOCK_MIN_PRICE', 1, 0.1, 1000),
     stockMaxPrice: num('SCAN_STOCK_MAX_PRICE', 60, 1, 100_000),

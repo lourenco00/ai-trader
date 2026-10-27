@@ -80,7 +80,8 @@ export class Commander extends Agent {
       if (t.strategy) continue;
       const activeSymbols = this.traders.filter((x) => x.strategy).map((x) => x.strategy!.symbol);
       const maxPerSymbol = Math.max(1, Math.ceil(this.traders.length / this.ctx.cfg.symbols.length));
-      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol);
+      // A trader given a strategy for a shut market would just stand idle; crypto never closes.
+      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol, (sym) => this.ctx.marketOpen(sym));
       if (!s) return;
       this.ctx.vault.assign(s.id, t.id);
       t.assign(s);

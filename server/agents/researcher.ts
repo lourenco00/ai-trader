@@ -31,7 +31,7 @@ export interface Validation {
 }
 
 export function backtestOptions(ctx: EcoContext, symbol: string): BacktestOptions {
-  return { feeRate: ctx.universe.feeRate(symbol), slippage: ctx.universe.slippage(symbol), barsPerYear: ctx.cfg.barsPerYear };
+  return { feeRate: ctx.universe.feeRate(symbol), slippage: ctx.universe.slippage(symbol), barsPerYear: ctx.universe.barsPerYear(symbol) };
 }
 
 /** Full train + untouched holdout check. The holdout is the most recent 30% of history. */

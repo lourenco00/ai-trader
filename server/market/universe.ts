@@ -150,10 +150,21 @@ export class Universe {
     return this.cfg.isCore(symbol);
   }
 
+  /**
+   * Bars per year for annualising Sharpe. Crypto trades around the clock; a US stock has
+   * only the 6.5h session on weekdays, so using the crypto figure would inflate its Sharpe ~2.3x.
+   */
+  barsPerYear(symbol: string): number {
+    if (this.cfg.assetClass(symbol) === 'crypto') return this.cfg.barsPerYear;
+    return Math.floor((6.5 * 3_600_000) / this.cfg.timeframeMs) * 252;
+  }
+
   /** Per-side fee as a fraction, matching what the execution venue really charges. */
   feeRate(symbol: string): number {
     if (this.cfg.execution !== 'alpaca') return this.cfg.feeRate;
-    return this.cfg.assetClass(symbol) === 'crypto' ? this.cfg.alpacaCryptoFee : 0;
+    if (this.cfg.assetClass(symbol) !== 'crypto') return 0;
+    // Entries and calm exits go out as limit orders when they can; stops always pay the taker fee.
+    return this.cfg.limitOrders ? (this.cfg.alpacaCryptoFee + this.cfg.alpacaCryptoMakerFee) / 2 + 0.0002 : this.cfg.alpacaCryptoFee;
   }
 
   // --- Research scheduling -----------------------------------------------------
@@ -162,7 +173,12 @@ export class Universe {
    * Picks the symbol whose turn it is: the one worked on least recently, counting
    * epochs already in flight. New arrivals have never been picked, so they go first.
    */
-  pickForResearch(candidates: readonly string[], tie: number): string {
+  pickForResearch(all: readonly string[], tie: number): string {
+    // Lean towards crypto: it trades 24/7 and is the focus. Stocks get the remaining epochs.
+    const crypto = all.filter((s) => this.cfg.assetClass(s) === 'crypto');
+    const stocks = all.filter((s) => this.cfg.assetClass(s) === 'stock');
+    const wantCrypto = stocks.length === 0 || (crypto.length > 0 && Math.random() < this.cfg.universe.cryptoFocus);
+    const candidates = wantCrypto ? crypto : stocks;
     let best = candidates[0];
     let bestKey = Infinity;
     candidates.forEach((sym, i) => {

@@ -215,12 +215,23 @@ export class Trader extends Agent {
       return;
     }
     const long = g.side === 'long';
-    const fill = await this.ctx.broker.marketOrder({
-      symbol: s.symbol,
-      side: long ? 'buy' : 'sell',
-      qty: notional / price,
-      refPrice: price,
-    });
+    let fill;
+    try {
+      fill = await this.ctx.broker.marketOrder({
+        symbol: s.symbol,
+        side: long ? 'buy' : 'sell',
+        qty: notional / price,
+        refPrice: price,
+      });
+    } catch (err) {
+      // A resting entry that never filled is not an error: the price ran away and we stay flat.
+      if (/not filled|spread too wide/.test((err as Error).message)) {
+        this.activity = `${s.symbol} entry skipped: ${(err as Error).message.slice(0, 60)}`;
+        this.mood = 'neutral';
+        return;
+      }
+      throw err;
+    }
     const dir = long ? 1 : -1;
     this.wallet.cash -= fill.fee;
     this.wallet.position = {
@@ -274,7 +285,9 @@ export class Trader extends Agent {
     const p = this.wallet.position;
     if (!p) return;
     const long = p.side === 'long';
-    const fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price, closing: true });
+    // Only calm exits may rest as limit orders; anything else (stops, kill switch, retirement) leaves immediately.
+    const urgent = !['take profit', 'exit signal', 'time limit'].includes(reason);
+    const fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price, closing: true, urgent });
     const gross = (fill.price - p.entryPrice) * p.qty * (long ? 1 : -1);
     this.wallet.cash += gross - fill.fee;
     this.wallet.position = null;

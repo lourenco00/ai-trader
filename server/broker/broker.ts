@@ -11,6 +11,8 @@ export interface OrderRequest {
   refPrice: number;
   /** True when this order exits an open position, so a venue can close the real position exactly. */
   closing?: boolean;
+  /** True for stops and forced exits, which must leave now. Calm exits and entries may rest as limit orders. */
+  urgent?: boolean;
 }
 
 export interface Fill {
