@@ -6,6 +6,7 @@ secrets.env
 data
 data-niche
 data-hi
+data-small
 data-live
 LIVE_APPROVAL.json
 LIVE_APPROVAL.json.previous

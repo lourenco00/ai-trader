@@ -17,6 +17,7 @@
     "report": "tsx server/report.ts",
     "niche": "tsx server/niche.ts",
     "hi": "tsx server/hiact.ts",
+    "small": "tsx server/smallcap.ts",
     "daily": "tsx server/daily.ts",
     "approve-live": "tsx server/approve-live.ts",
     "coin": "tsx server/coin.ts",

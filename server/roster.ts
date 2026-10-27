@@ -14,7 +14,7 @@ export const RESEARCHERS: { id: string; name: string; specialty: Specialty; look
   { id: 'r_carl', name: 'Carl', specialty: 'wildcard', look: { skin: '#e0ac69', hair: '#999999', shirt: '#f4f4f4', pants: '#4a3a2a', hat: 'goggles' } },
 ];
 
-export const TRADERS: { id: string; name: string; look: Appearance }[] = [
+const BASE_TRADERS: { id: string; name: string; look: Appearance }[] = [
   { id: 't_earl', name: 'Earl', look: { skin: '#f1c27d', hair: '#5a3a1a', shirt: '#2e8b57', pants: '#2b2b3b', hat: 'visor' } },
   { id: 't_ant', name: 'Ant', look: { skin: '#c68642', hair: '#111111', shirt: '#d9534f', pants: '#2b2b3b', hat: 'cap' } },
   { id: 't_rosa', name: 'Rosa', look: { skin: '#ffdbac', hair: '#a0522d', shirt: '#f0ad4e', pants: '#3b3b5b', hat: 'visor' } },
@@ -26,6 +26,20 @@ export const TRADERS: { id: string; name: string; look: Appearance }[] = [
   { id: 't_rex', name: 'Rex', look: { skin: '#e0ac69', hair: '#222222', shirt: '#34495e', pants: '#1b1b2b', hat: 'visor' } },
   { id: 't_wren', name: 'Wren', look: { skin: '#8d5524', hair: '#6b3e26', shirt: '#27ae60', pants: '#2b2b3b', hat: 'cap' } },
 ];
+
+const EXTRA_NAMES = ['Abe', 'Bea', 'Cal', 'Dot', 'Eli', 'Fay', 'Gil', 'Hal', 'Ida', 'Jax', 'Kai', 'Lou', 'Mae', 'Ned', 'Oly', 'Pia', 'Quin', 'Ray', 'Sal', 'Tia', 'Uma', 'Vic', 'Wes', 'Xia', 'Yan', 'Zed', 'Bo', 'Cy', 'Di', 'Eve'];
+const SKINS = ['#f1c27d', '#c68642', '#ffdbac', '#e0ac69', '#8d5524'];
+const HAIRS = ['#3b2219', '#111111', '#d9a441', '#8b3a1a', '#2b1a10', '#6b4e2e', '#dcdcdc', '#c94f2c'];
+const SHIRTS = ['#2e8b57', '#d9534f', '#f0ad4e', '#5bc0de', '#9b59b6', '#1abc9c', '#e67e22', '#e84393', '#34495e', '#27ae60'];
+// Ids stay stable (t_<name>) so saved wallets map back to the same villager after a restart.
+for (let i = 0; i < EXTRA_NAMES.length; i++) {
+  BASE_TRADERS.push({
+    id: 't_' + EXTRA_NAMES[i].toLowerCase(),
+    name: EXTRA_NAMES[i],
+    look: { skin: SKINS[i % SKINS.length], hair: HAIRS[(i * 3) % HAIRS.length], shirt: SHIRTS[(i * 7) % SHIRTS.length], pants: '#2b2b3b', hat: i % 2 ? 'cap' : 'visor' },
+  });
+}
+export const TRADERS = BASE_TRADERS;
 
 export const NEWS_ANCHORS: { id: string; name: string; beat: string; look: Appearance }[] = [
   { id: 'n_vera', name: 'Vera', beat: 'crypto wire', look: { skin: '#ffdbac', hair: '#2b1a10', shirt: '#b03a52', pants: '#2b2b3b', hat: 'press' } },

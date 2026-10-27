@@ -17,20 +17,24 @@ env.LLM_API_KEY = ''; // no paid LLM here
 env.NEWS_ENABLED = 'false';
 env.SYMBOLS = '$SPY,$QQQ,$NVDA,$TSLA,$AMD,BTC,ETH';
 env.TIMEFRAME = '15m';
+env.TIMEFRAME_STOCK = '15m'; // commission-free stocks suit short candles
+env.TIMEFRAME_CRYPTO = '1h'; // crypto costs too much for 15m; small caps pass the gate on 1h
 env.STARTING_CAPITAL = '100000';
-env.TRADERS = '10';
+env.TRADERS = '24';
+env.MAX_TRIAL_TRADERS = '10';
+env.MAX_TRADERS_PER_MARKET = '8'; // strategies bunch up on a few volatile stocks; the exposure caps still bound the total
 env.RESEARCHERS = '8';
 env.MIN_TRAIN_TRADES = '120'; // four times the usual trades per window, so strategies trade often
 env.MIN_TEST_TRADES = '24';
 env.MIN_HALF_TRADES = '8';
 env.FLATTEN_BEFORE_CLOSE_MIN = '0';
-env.RESEARCH_CPU = '0.5'; // shares the server with three other funds
+env.RESEARCH_CPU = '0.9';
 env.FEE_RATE = '0.0025'; // crypto at Alpaca's taker rate; stocks are charged nothing
 env.SCAN_STOCKS = 'true';
 env.SCAN_INTERVAL_MIN = '15';
 env.SCAN_MAX_EXPLORED = '16';
 env.SCAN_ADD_PER_SCAN = '4';
-env.RESEARCH_CRYPTO_SHARE = '0.35';
+env.RESEARCH_CRYPTO_SHARE = '0.5';
 
 await import('./index');
 

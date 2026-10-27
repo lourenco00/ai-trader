@@ -58,7 +58,7 @@ export function backtestOptions(ctx: EcoContext, symbol: string): BacktestOption
 /** Full train + untouched holdout check. The holdout is the most recent 30% of history. */
 export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation {
   const opts = backtestOptions(ctx, data.symbol);
-  const p = ctx.cfg.research.promotion;
+  const p = ctx.universe.promotion(data.symbol);
   const train = backtest(data.cache, g, 0, data.trainEnd, opts).metrics;
   const test = backtest(data.cache, g, data.trainEnd, data.cache.length, opts).metrics;
   // Walk-forward: the holdout in two halves, judged separately.
@@ -241,7 +241,7 @@ export class Researcher extends Agent {
     }
     const opts = backtestOptions(this.ctx, data.symbol);
     const folds = 3;
-    const minTrades = Math.ceil(this.ctx.cfg.research.promotion.minTrainTrades / folds);
+    const minTrades = Math.ceil(this.ctx.universe.promotion(data.symbol).minTrainTrades / folds);
     // Score each fold of the training window separately. Weighting the worst fold
     // heavily favours strategies that hold up across regimes instead of one lucky stretch.
     const scores: number[] = [];

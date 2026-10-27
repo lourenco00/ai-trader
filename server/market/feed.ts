@@ -110,8 +110,9 @@ export class MarketFeed {
     if (!wasKnown) this.cfg.registerSymbol({ symbol, asset });
     try {
       const now = Date.now();
-      const raw = await p.fetchHistory(symbol, this.cfg.timeframeMs, this.cfg.historyBars + 1);
-      const closed = raw.filter((c) => c.t + this.cfg.timeframeMs <= now);
+      const tf = this.cfg.timeframeFor(symbol);
+      const raw = await p.fetchHistory(symbol, tf, this.cfg.historyBars + 1);
+      const closed = raw.filter((c) => c.t + tf <= now);
       if (closed.length < minBars) return `only ${closed.length} bars of history`;
       const last = closed[closed.length - 1];
       if (now - last.t > 12 * 3_600_000 && asset === 'crypto') return 'history is stale';
@@ -178,8 +179,9 @@ export class MarketFeed {
   private async loadHistory(p: MarketDataProvider, symbols: string[]): Promise<void> {
     const now = Date.now();
     for (const symbol of symbols) {
-      const raw = await p.fetchHistory(symbol, this.cfg.timeframeMs, this.cfg.historyBars + 1);
-      const closed = raw.filter((c) => c.t + this.cfg.timeframeMs <= now);
+      const tf = this.cfg.timeframeFor(symbol);
+      const raw = await p.fetchHistory(symbol, tf, this.cfg.historyBars + 1);
+      const closed = raw.filter((c) => c.t + tf <= now);
       if (closed.length < MIN_HISTORY) {
         throw new Error(`${symbol}: only ${closed.length} candles of history, need at least ${MIN_HISTORY}`);
       }
@@ -243,8 +245,8 @@ export class MarketFeed {
 
   private async syncCandles(): Promise<void> {
     const now = Date.now();
-    const tf = this.cfg.timeframeMs;
     for (const symbol of this.cfg.symbols) {
+      const tf = this.cfg.timeframeFor(symbol);
       const series = this.candles.get(symbol);
       const p = this.providerOf.get(symbol);
       if (!series || series.length === 0 || !p) continue;

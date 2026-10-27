@@ -27,6 +27,10 @@ const TIMEFRAMES: Record<string, number> = { '5m': 5 * 60_000, '15m': 15 * 60_00
 
 const timeframe = env.TIMEFRAME?.trim() || '15m';
 const timeframeMs = TIMEFRAMES[timeframe];
+// Stocks and crypto can run on different candle sizes in one fund: 15-minute candles suit commission-free
+// stocks, but crypto's round-trip cost is bigger than most 15-minute moves and works on 1h or slower.
+const tfStockName = env.TIMEFRAME_STOCK?.trim() || timeframe;
+const tfCryptoName = env.TIMEFRAME_CRYPTO?.trim() || timeframe;
 if (timeframeMs === undefined) {
   throw new Error(`config: TIMEFRAME must be one of ${Object.keys(TIMEFRAMES).join(', ')}`);
 }
@@ -141,8 +145,10 @@ export const config = {
     const j = symbolSpecs.findIndex((s) => s.symbol === symbol);
     if (j >= 0) symbolSpecs.splice(j, 1);
   },
-  timeframe,
+  timeframe: tfStockName === tfCryptoName ? timeframe : `stocks ${tfStockName}, crypto ${tfCryptoName}`,
   timeframeMs,
+  /** Candle size for this symbol's asset class, in ms. */
+  timeframeFor: (symbol: string): number => TIMEFRAMES[assetOf.get(symbol) === 'stock' ? tfStockName : tfCryptoName] ?? timeframeMs,
   barsPerYear: (365 * 24 * 60 * 60_000) / timeframeMs,
   historyBars: num('HISTORY_BARS', 10_000, 1500, 20_000),
   provider,
@@ -159,7 +165,7 @@ export const config = {
   slippage: num('SLIPPAGE_BPS', 3, 0, 100) / 10_000,
 
   researchers: Math.round(num('RESEARCHERS', 4, 1, 8)),
-  traders: Math.round(num('TRADERS', 6, 1, 10)),
+  traders: Math.round(num('TRADERS', 6, 1, 40)),
   researchCpu: num('RESEARCH_CPU', 0.35, 0.05, 0.9),
 
   allocation: {
@@ -215,9 +221,11 @@ export const config = {
     vaultCapacity: 30,
     /** Trial strategies (positive holdout, short of the strict gate): how many may trade at once, and their size relative to a proven strategy's probation size. */
     // Real money runs only strategies that passed the strict gate.
-    maxTrialTraders: wantsLive ? 0 : aggressive ? 5 : 2,
+    maxTrialTraders: wantsLive ? 0 : Math.round(num('MAX_TRIAL_TRADERS', aggressive ? 5 : 2, 0, 40)),
     /** Fewest traders allowed on one market. The aggressive profile lets 3 share a market so no trader sits idle while good strategies wait. */
-    minTradersPerMarketCap: aggressive ? 3 : 1,
+    // Concentration is already limited by the exposure caps in risk, so several traders may run different
+    // strategies on one market instead of sitting idle while good strategies wait.
+    minTradersPerMarketCap: Math.round(num('MAX_TRADERS_PER_MARKET', 3, 1, 40)),
     trialSizeFactor: aggressive ? 0.5 : 0.25,
   },
 

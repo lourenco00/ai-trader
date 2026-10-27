@@ -38,11 +38,23 @@ services:
     ports: ["127.0.0.1:8789:8789"]
     volumes: ["./data-hi:/app/data-hi"]
 
+  # Small-cap crypto research (hourly candles, simulated fills on Binance prices, OKX-level fees).
+  small:
+    <<: *app
+    command: ["npx", "tsx", "server/smallcap.ts"]
+    ports: ["127.0.0.1:8790:8790"]
+    volumes: ["./data-small:/app/data-small"]
+
   # Real money. Leave this commented out until `npm run approve-live` has written LIVE_APPROVAL.json
   # and you have set ALPACA_PAPER=false for this service only. It refuses to start without the file.
   # live:
   #   <<: *app
   #   command: ["npx", "tsx", "server/index.ts"]
+  #   # Live API keys live in their own file (secrets-live.env), never mixed with the paper keys. It must also
+  #   # hold EXECUTION=alpaca and the live ALPACA_KEY_ID / ALPACA_SECRET, with TRADERS, SYMBOLS etc. for the live fund.
+  #   env_file:
+  #     - path: secrets-live.env
+  #       format: raw
   #   environment:
   #     HOST: 0.0.0.0
   #     TZ: UTC

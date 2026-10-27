@@ -26,7 +26,7 @@ export class Scout extends Agent {
   }
 
   watch(symbol: string): void {
-    this.readings.set(symbol, readRegime(this.ctx.feed.series(symbol), this.ctx.cfg.barsPerYear));
+    this.readings.set(symbol, readRegime(this.ctx.feed.series(symbol), this.ctx.universe.barsPerYear(symbol)));
   }
 
   forget(symbol: string): void {
@@ -37,7 +37,7 @@ export class Scout extends Agent {
     this.candlesSeen++;
     this.addXp(1);
     const prev = this.readings.get(symbol);
-    const next = readRegime(this.ctx.feed.series(symbol), this.ctx.cfg.barsPerYear);
+    const next = readRegime(this.ctx.feed.series(symbol), this.ctx.universe.barsPerYear(symbol));
     this.readings.set(symbol, next);
     this.activity = `New ${symbol} candle: ${REGIME_TEXT[next.regime]}`;
     if (prev && prev.regime !== next.regime && next.regime !== 'unknown') {
@@ -74,7 +74,7 @@ export class Scout extends Agent {
       direction,
       confidence,
       headline: `Chart regime ${r.regime} (trend ${(r.trend * 100).toFixed(1)}%, vol ${(r.volatility * 100).toFixed(0)}%)`,
-      expiresAt: Date.now() + 6 * this.ctx.cfg.timeframeMs,
+      expiresAt: Date.now() + 6 * this.ctx.cfg.timeframeFor(symbol),
       refPrice: price,
     });
   }
@@ -84,9 +84,9 @@ export class Scout extends Agent {
   }
 
   markets(): MarketDTO[] {
-    const tf = this.ctx.cfg.timeframeMs;
-    const dayBars = Math.round(86_400_000 / tf);
     return this.ctx.cfg.symbols.map((symbol) => {
+      const tf = this.ctx.cfg.timeframeFor(symbol);
+      const dayBars = Math.round(86_400_000 / tf);
       const series = this.ctx.feed.series(symbol);
       const price = this.ctx.feed.price(symbol) ?? series[series.length - 1]?.c ?? 0;
       const ref = series[series.length - dayBars]?.c ?? series[0]?.c ?? price;

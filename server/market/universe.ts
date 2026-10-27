@@ -156,10 +156,27 @@ export class Universe {
    * only the 6.5h session on weekdays, so using the crypto figure would inflate its Sharpe ~2.3x.
    */
   barsPerYear(symbol: string): number {
-    if (this.cfg.assetClass(symbol) === 'crypto') return this.cfg.barsPerYear;
+    if (this.cfg.assetClass(symbol) === 'crypto') return (365 * 24 * 3_600_000) / this.cfg.timeframeFor(symbol);
     // Slower than the 6.5h session means one bar a day.
-    const perDay = Math.max(1, (6.5 * 3_600_000) / this.cfg.timeframeMs);
+    const perDay = Math.max(1, (6.5 * 3_600_000) / this.cfg.timeframeFor(symbol));
     return perDay * 252;
+  }
+
+  /**
+   * The promotion gate for this market. The trade-count requirements are set for 15-minute candles; a slower
+   * market has proportionally fewer bars and so fewer trades, so they scale down with the candle size, but never
+   * below the standard minimums (30 train, 6 holdout, 2 per half). Every quality test is unchanged.
+   */
+  promotion(symbol: string): Config['research']['promotion'] {
+    const base = this.cfg.research.promotion;
+    const factor = Math.min(1, 900_000 / this.cfg.timeframeFor(symbol));
+    const scale = (v: number, floor: number) => Math.max(floor, Math.round(v * factor));
+    return {
+      ...base,
+      minTrainTrades: scale(base.minTrainTrades, 30),
+      minTestTrades: scale(base.minTestTrades, 6),
+      minHalfTrades: scale(base.minHalfTrades, 2),
+    };
   }
 
   /** Per-side fee as a fraction, matching what the execution venue really charges. */
