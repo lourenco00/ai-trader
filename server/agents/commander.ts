@@ -53,6 +53,8 @@ export class Commander extends Agent {
   /** Called every minute. Cheap checks first, rebalance hourly. */
   async tick(): Promise<void> {
     if (this.ctx.risk.halted) {
+      // A halt forbids allocation, not confirmed residual liquidation.
+      for (const t of this.traders) if (t.retiringReason && !t.orderPending) await this.retire(t,t.retiringReason);
       this.activity = 'Trading halted. Waiting for the all-clear';
       this.mood = 'sad';
       return;
@@ -77,9 +79,9 @@ export class Commander extends Agent {
   assignIdle(): void {
     if (this.ctx.risk.halted) return;
     for (const t of this.traders) {
-      if (t.strategy) continue;
+      if (t.strategy || t.orderPending || t.wallet.position || t.exitOnly || t.retiringReason || t.executionIntent) continue;
       const activeSymbols = this.traders.filter((x) => x.strategy).map((x) => x.strategy!.symbol);
-      const maxPerSymbol = Math.max(this.ctx.cfg.research.minTradersPerMarketCap, Math.ceil(this.traders.length / this.ctx.cfg.symbols.length));
+      const maxPerSymbol = 1;
       // A trader given a strategy for a shut market would just stand idle; crypto never closes.
       // Only a few traders at a time run trial strategies, so unproven ideas stay a small part of the fund.
       const trialsActive = this.traders.filter((x) => x.strategy?.trial).length;
@@ -112,7 +114,7 @@ export class Commander extends Agent {
     const waiting = this.ctx.vault.byStatus('vault');
     for (const t of this.traders) {
       const cur = t.strategy;
-      if (!cur || t.wallet.position || cur.live.trades > 0) continue;
+      if (!cur || t.wallet.position || t.orderPending || t.exitOnly || t.retiringReason || t.executionIntent || cur.live.trades > 0) continue;
       const better = waiting
         .filter((s) => s.symbol === cur.symbol && s.fitness > cur.fitness + 0.5)
         .sort((a, b) => b.fitness - a.fitness)[0];
@@ -140,16 +142,19 @@ export class Commander extends Agent {
     const base = this.baseFraction();
     let moved = 0;
     for (const t of this.traders) {
-      if (!t.strategy || t.wallet.position) continue;
+      if (!t.strategy || t.wallet.position || t.orderPending || t.exitOnly || t.retiringReason || t.executionIntent) continue;
       const live = t.strategy.live;
       let fraction: number;
-      if (live.trades < a.probationTrades) {
-        fraction = base * 0.5;
+      const pf = live.grossLoss > 0 ? live.grossWin / live.grossLoss : live.grossWin > 0 ? Infinity : 0;
+      const proven = live.trades >= a.probationTrades && live.pnl > 0 && pf >= 1.3;
+      if (!proven) {
+        fraction = base * (t.strategy.trial ? this.ctx.cfg.research.trialSizeFactor : 0.5);
       } else {
         const ret = t.navSinceAssign() - 1;
         fraction = base * Math.max(0.25, Math.min(2, 1 + ret * 10));
       }
       fraction = Math.min(a.maxTraderFraction, Math.max(a.minTraderFraction, fraction));
+      if (!proven) fraction = Math.min(fraction, base * (t.strategy.trial ? this.ctx.cfg.research.trialSizeFactor : 0.5));
       if (t.strategy.trial) fraction = Math.min(fraction, base * Math.max(0.5, this.ctx.cfg.research.trialSizeFactor * 2));
       const target = equity * fraction;
       const current = t.equity();
@@ -181,10 +186,11 @@ export class Commander extends Agent {
     const maxDd = this.ctx.cfg.risk.traderMaxDrawdown;
     for (const t of this.traders) {
       const s = t.strategy;
-      if (!s) continue;
+      if (!s || t.orderPending) continue;
+      if (t.retiringReason) { await this.retire(t,t.retiringReason); continue; }
       const live = s.live;
       // A trial that proves itself live earns full status and full-size capital.
-      if (s.trial && live.trades >= 10 && live.grossLoss > 0 && live.grossWin / live.grossLoss >= 1.3 && t.navSinceAssign() > 1) {
+      if (s.trial && live.trades >= this.ctx.cfg.allocation.probationTrades && live.pnl > 0 && live.grossLoss > 0 && live.grossWin / live.grossLoss >= 1.3 && t.navSinceAssign() > 1) {
         s.trial = false;
         this.addXp(20);
         this.ctx.news('allocation', `"${s.name}" (${s.symbol}) passed its trial live: profit factor ${(live.grossWin / live.grossLoss).toFixed(2)} over ${live.trades} trades. Full status`, { agentId: this.id, good: true });
@@ -204,12 +210,15 @@ export class Commander extends Agent {
   async retire(t: Trader, reason: string): Promise<void> {
     const s = t.strategy;
     if (!s) return;
+    t.retiringReason ??= reason;
     await t.flatten(`retired: ${reason}`);
+    if (t.wallet.position || t.executionIntent || t.orderPending) return;
     const epitaph = EPITAPHS[Math.floor(Math.random() * EPITAPHS.length)];
     this.ctx.vault.retire(s.id, reason, epitaph);
     const back = t.withdraw(t.wallet.cash);
     this.treasury.reserve += back;
     t.unassign();
+    t.retiringReason = null;
     this.retirements++;
     this.addXp(8);
     this.ctx.news('retire', `${this.name} retired "${s.name}" from ${t.name}: ${reason}. Live P&L $${s.live.pnl.toFixed(2)} over ${s.live.trades} trades`, { agentId: this.id, good: false });

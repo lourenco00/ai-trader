@@ -172,14 +172,16 @@ export const config = {
     reserveFraction: aggressive ? 0.05 : 0.2,
     maxTraderFraction: aggressive ? 0.4 : 0.25,
     minTraderFraction: 0.03,
-    probationTrades: 5,
+    probationTrades: 20,
     rebalanceEveryMs: 60 * 60_000,
   },
 
   risk: {
+    unprovenTradeRisk: 0.001,
+    maxSymbolStopRisk: 0.0025,
     fundMaxDrawdown: aggressive ? 0.3 : 0.2,
     traderMaxDrawdown: aggressive ? 0.2 : 0.12,
-    dailyLossLimit: aggressive ? 0.08 : 0.05,
+    dailyLossLimit: 0.01,
     /** Position size multiplier on a trader's wallet (margin). 1 = fully cash-backed. */
     leverage: aggressive ? num('LEVERAGE', 2, 1, 4) : 1,
     maxGrossExposure: aggressive ? num('LEVERAGE', 2, 1, 4) : 1.0,
@@ -222,10 +224,8 @@ export const config = {
     /** Trial strategies (positive holdout, short of the strict gate): how many may trade at once, and their size relative to a proven strategy's probation size. */
     // Real money runs only strategies that passed the strict gate.
     maxTrialTraders: wantsLive ? 0 : Math.round(num('MAX_TRIAL_TRADERS', aggressive ? 5 : 2, 0, 40)),
-    /** Fewest traders allowed on one market. The aggressive profile lets 3 share a market so no trader sits idle while good strategies wait. */
-    // Concentration is already limited by the exposure caps in risk, so several traders may run different
-    // strategies on one market instead of sitting idle while good strategies wait.
-    minTradersPerMarketCap: Math.round(num('MAX_TRADERS_PER_MARKET', 3, 1, 40)),
+    /** Exclusive symbol ownership; MAX_TRADERS_PER_MARKET cannot relax this safety bound. */
+    minTradersPerMarketCap: 1,
     trialSizeFactor: aggressive ? 0.5 : 0.25,
   },
 

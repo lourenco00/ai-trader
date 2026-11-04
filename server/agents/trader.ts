@@ -7,6 +7,7 @@ import { logger } from '../util/log';
 import { shortId } from '../util/rng';
 import { Agent } from './base';
 import type { EcoContext } from './context';
+import { NotSubmittedError } from '../broker/broker';
 
 const log = logger('trader');
 
@@ -22,6 +23,8 @@ export interface Position {
   extreme: number;
   barsHeld: number;
   strategyId: string;
+  /** Realized fragments of this round trip, retained across partial exits/restarts. */
+  partialPnl?: number;
 }
 
 /**
@@ -47,6 +50,10 @@ export class Trader extends Agent {
   trades = 0;
   wins = 0;
   streak = 0;
+  orderPending = false;
+  executionIntent: { kind: 'entry' | 'exit'; symbol: string; qty: number; side: 'buy' | 'sell'; at: number } | null = null;
+  exitOnly = false;
+  retiringReason: string | null = null;
   private queue: Promise<void> = Promise.resolve();
   private lastBlockedBar = 0;
 
@@ -192,6 +199,7 @@ export class Trader extends Agent {
   }
 
   private async open(s: StrategyRecord, price: number, atr: number, barT: number): Promise<void> {
+    if (this.executionIntent || this.exitOnly || this.retiringReason) return;
     const g = s.genome;
     if (!this.ctx.marketOpen(s.symbol)) {
       this.activity = `${s.symbol} market is closed; waiting for the open`;
@@ -199,12 +207,23 @@ export class Trader extends Agent {
       return;
     }
     // Leave headroom for fees and slippage so margin never exceeds cash (1x).
-    const notional = this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage;
+    const stopDistance = g.stopAtr * atr;
+    if (!(stopDistance > 0) || !Number.isFinite(stopDistance) || !(price > 0)) return;
+    // No automatic per-trade risk escalation: forward proof only unlocks wallet allocation.
+    const plannedNotional = Math.min(this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage,
+      this.ctx.fund.equity() * this.ctx.cfg.risk.unprovenTradeRisk * price / stopDistance);
+    const qty = this.ctx.broker.entryQty?.(s.symbol,plannedNotional / price) ?? plannedNotional / price;
+    if (!(qty > 0) || !Number.isFinite(qty) || qty > plannedNotional / price) {
+      this.activity = `${s.symbol} entry skipped: below venue lot minimum or invalid quantity`;
+      return;
+    }
+    const notional = qty * price;
     if (notional < MIN_NOTIONAL) {
       this.activity = 'Signal fired but my wallet is empty';
       return;
     }
-    const verdict = this.ctx.risk.approveEntry({ traderId: this.id, symbol: s.symbol, notional, side: g.side });
+    const entryRequest = { traderId: this.id, symbol: s.symbol, notional, side: g.side, stopRisk: qty * stopDistance, unproven: true };
+    const verdict = this.ctx.risk.reserveEntry(entryRequest);
     if (!verdict.ok) {
       this.activity = `Entry blocked: ${verdict.reason}`;
       this.mood = 'sad';
@@ -216,20 +235,37 @@ export class Trader extends Agent {
     }
     const long = g.side === 'long';
     let fill;
+    this.orderPending = true;
+    this.executionIntent = {kind:'entry',symbol:s.symbol,qty,side:long ? 'buy' : 'sell',at:Date.now()};
     try {
+      await this.ctx.persistExecution();
+      if (this.exitOnly || this.retiringReason) throw new NotSubmittedError('trader became exit-only during entry checkpoint');
+      if (!this.ctx.marketOpen(s.symbol)) throw new NotSubmittedError('market closed during entry checkpoint');
+      const currentPrice = this.ctx.feed.price(s.symbol);
+      if (currentPrice === undefined || !(currentPrice > 0) || !Number.isFinite(currentPrice)) throw new NotSubmittedError('current entry price unavailable');
+      const currentNotional = qty * currentPrice;
+      const walletBudget = this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage;
+      if (currentNotional > walletBudget) throw new NotSubmittedError('wallet entry budget reduced during checkpoint');
+      const authorization = this.ctx.risk.revalidateEntry({ ...entryRequest, notional: currentNotional });
+      if (!authorization.ok) throw new NotSubmittedError(`authorization revoked: ${authorization.reason}`);
+      // No await between the final authorization and invoking the broker.
       fill = await this.ctx.broker.marketOrder({
         symbol: s.symbol,
         side: long ? 'buy' : 'sell',
-        qty: notional / price,
-        refPrice: price,
+        qty,
+        refPrice: currentPrice,
       });
     } catch (err) {
-      // A resting entry that never filled is not an error: the price ran away and we stay flat.
-      if (/not filled|spread too wide|exceeds live cap/.test((err as Error).message)) {
+      this.orderPending = false;
+      // Only an adapter's explicit no-submission guarantee is safe to release.
+      if (err instanceof NotSubmittedError) {
+        this.orderPending = true;
+        await this.completeExecution();
         this.activity = `${s.symbol} entry skipped: ${(err as Error).message.slice(0, 60)}`;
         this.mood = 'neutral';
         return;
       }
+      this.ctx.risk.requireReview(`Entry ${s.symbol}: ${(err as Error).message}`);
       throw err;
     }
     const dir = long ? 1 : -1;
@@ -247,6 +283,7 @@ export class Trader extends Agent {
       barsHeld: 0,
       strategyId: s.id,
     };
+    await this.completeExecution();
     this.addXp(5);
     this.mood = 'excited';
     this.activity = `Opened ${g.side.toUpperCase()} ${s.symbol} @ ${fmtPrice(fill.price)}`;
@@ -282,16 +319,33 @@ export class Trader extends Agent {
   }
 
   private async close(price: number, reason: string): Promise<void> {
+    if (this.executionIntent) return;
     const p = this.wallet.position;
     if (!p) return;
     const long = p.side === 'long';
     // Only calm exits may rest as limit orders; anything else (stops, kill switch, retirement) leaves immediately.
     const urgent = !['take profit', 'exit signal', 'time limit'].includes(reason);
-    const fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price, closing: true, urgent });
-    const gross = (fill.price - p.entryPrice) * p.qty * (long ? 1 : -1);
+    let fill;
+    this.orderPending = true;
+    this.ctx.risk.orderChanged();
+    this.executionIntent = {kind:'exit',symbol:p.symbol,qty:p.qty,side:long ? 'sell' : 'buy',at:Date.now()};
+    try {
+      await this.ctx.persistExecution();
+      fill = await this.ctx.broker.marketOrder({ symbol: p.symbol, side: long ? 'sell' : 'buy', qty: p.qty, refPrice: price, closing: true, urgent });
+      if (!(fill.qty > 0) || !Number.isFinite(fill.qty) || fill.qty > p.qty * (1 + 1e-8)) throw new Error('exit quantity does not match owned position');
+    } catch (err) {
+      this.orderPending = false;
+      this.ctx.risk.orderChanged();
+      this.ctx.risk.requireReview((err as Error).message);
+      throw err;
+    }
+    const closedQty = Math.min(fill.qty, p.qty);
+    const entryFee = p.entryFee * closedQty / p.qty;
+    const gross = (fill.price - p.entryPrice) * closedQty * (long ? 1 : -1);
     this.wallet.cash += gross - fill.fee;
-    this.wallet.position = null;
-    const net = gross - fill.fee - p.entryFee;
+    const net = gross - fill.fee - entryFee;
+    const completedPnl = (p.partialPnl ?? 0) + net;
+    this.wallet.position = p.qty - closedQty > 1e-8 ? { ...p, qty:p.qty-closedQty, entryFee:p.entryFee-entryFee, partialPnl:completedPnl } : null;
     const s = this.strategy && this.strategy.id === p.strategyId ? this.strategy : this.ctx.vault.get(p.strategyId);
 
     const trade: TradeDTO = {
@@ -302,43 +356,48 @@ export class Trader extends Agent {
       strategyName: s?.name ?? 'unknown',
       symbol: p.symbol,
       side: p.side,
-      qty: p.qty,
+      qty: closedQty,
       entryPrice: p.entryPrice,
       exitPrice: fill.price,
       entryTime: p.entryTime,
       exitTime: fill.time,
       pnl: net,
-      pnlPct: net / (p.qty * p.entryPrice),
-      fees: fill.fee + p.entryFee,
+      pnlPct: net / (closedQty * p.entryPrice),
+      fees: fill.fee + entryFee,
       reason,
     };
 
     if (s) {
-      s.live.trades++;
       s.live.pnl += net;
       s.live.lastTradeAt = fill.time;
-      if (net > 0) {
-        s.live.wins++;
-        s.live.grossWin += net;
-      } else {
-        s.live.grossLoss -= net;
+      if (!this.wallet.position) {
+        s.live.trades++;
+        if (completedPnl > 0) {
+          s.live.wins++;
+          s.live.grossWin += completedPnl;
+        } else {
+          s.live.grossLoss -= completedPnl;
+        }
       }
     }
-    this.trades++;
-    if (net > 0) {
-      this.wins++;
-      this.streak = this.streak > 0 ? this.streak + 1 : 1;
-      this.addXp(10 + Math.min(200, trade.pnlPct * 2000));
-      this.mood = 'excited';
-    } else {
-      this.streak = this.streak < 0 ? this.streak - 1 : -1;
-      this.addXp(4);
-      this.mood = 'sad';
+    if (!this.wallet.position) {
+      this.trades++;
+      if (completedPnl > 0) {
+        this.wins++;
+        this.streak = this.streak > 0 ? this.streak + 1 : 1;
+        this.addXp(10 + Math.min(200, trade.pnlPct * 2000));
+        this.mood = 'excited';
+      } else {
+        this.streak = this.streak < 0 ? this.streak - 1 : -1;
+        this.addXp(4);
+        this.mood = 'sad';
+      }
     }
     const rel = this.navSinceAssign();
     if (rel > this.peakNav) this.peakNav = rel;
     this.activity = `Closed ${p.symbol} ${reason}: ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}`;
     this.ctx.recordTrade(trade);
+    await this.completeExecution();
     this.ctx.emit({
       kind: 'trade_close',
       agentId: this.id,
@@ -346,6 +405,23 @@ export class Trader extends Agent {
       value: net,
       building: 'markets',
     });
+  }
+
+  /** Persist booking and intent removal together; disk failure remains non-resumable. */
+  private async completeExecution(): Promise<void> {
+    const intent = this.executionIntent;
+    this.executionIntent = null;
+    const reservation = intent?.kind === 'entry' ? this.ctx.risk.releaseEntry(this.id) : undefined;
+    try { await this.ctx.persistExecution(); }
+    catch (err) {
+      this.executionIntent = intent;
+      if (reservation) this.ctx.risk.retainEntry(reservation);
+      this.ctx.risk.requireReview(`Execution booking could not be persisted: ${(err as Error).message}`);
+      throw err;
+    } finally {
+      this.orderPending = false;
+      this.ctx.risk.orderChanged();
+    }
   }
 
   positionDTO(): PositionDTO | null {
@@ -402,6 +478,9 @@ export class Trader extends Agent {
   protected saveExtra(): unknown {
     return {
       wallet: this.wallet,
+      executionIntent: this.executionIntent,
+      exitOnly: this.exitOnly,
+      retiringReason: this.retiringReason,
       strategyId: this.strategy?.id ?? null,
       assignedAt: this.assignedAt,
       navAtAssign: this.navAtAssign,
@@ -415,6 +494,9 @@ export class Trader extends Agent {
   protected restoreExtra(extra: unknown): void {
     const e = extra as Partial<{
       wallet: Wallet;
+      executionIntent: Trader['executionIntent'];
+      exitOnly: boolean;
+      retiringReason: string | null;
       strategyId: string | null;
       assignedAt: number;
       navAtAssign: number;
@@ -424,6 +506,9 @@ export class Trader extends Agent {
       streak: number;
     }>;
     if (e.wallet && Number.isFinite(e.wallet.cash)) this.wallet = e.wallet;
+    this.executionIntent = e.executionIntent ?? null;
+    this.exitOnly = e.exitOnly === true;
+    this.retiringReason = e.retiringReason ?? null;
     if (e.strategyId) {
       const s = this.ctx.vault.get(e.strategyId);
       if (s && s.status === 'active') this.strategy = s;

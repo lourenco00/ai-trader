@@ -204,20 +204,24 @@ function warroom(s: WorldSnapshot): PanelView {
   const f = s.fund;
   const dayLoss = Math.max(0, f.dayStartEquity > 0 ? 1 - f.equity / f.dayStartEquity : 0);
   const exposure = f.equity > 0 ? f.grossExposure / f.equity : 0;
-  const status = r.halted ? `<span class="bad">HALTED</span>: ${esc(r.haltReason)}` : r.cooldownUntil ? `<span class="bad">COOLDOWN</span> until ${dateTime(r.cooldownUntil)}` : r.dataStale ? '<span class="bad">DATA STALE</span>, entries blocked' : '<span class="good">ARMED</span>, all limits green';
+  const status = r.halted ? `<span class="bad">HALTED</span>: ${esc(r.haltReason)}` : r.entriesPaused ? `<span class="bad">ENTRY PAUSED</span>: ${r.entryPauseReasons.map(esc).join('; ')}. Exits remain available` : '<span class="good">ARMED</span>, all limits green';
   const llm = s.llmCost;
   return {
     title: 'WAR ROOM',
     sub: 'Sarge checks every entry against the limits below and can flatten the whole fund.',
     html: `
       <p style="font-size:24px">Status: ${status}</p>
+      <p>Planned stop risk: ${pct(r.limits.unprovenTradeRisk,2,false)} per trade; ${pct(r.limits.maxSymbolStopRisk,2,false)} shared per symbol. One symbol owner including pending entries. Stop prices do not guarantee realized loss.</p>
+      <p>Broker reconciliation: ${s.execution === 'local' ? 'local simulation (no external broker)' : r.reconciliationCurrent ? 'current' : 'unavailable / stale / invalidated'}. Last observation ${r.reconciliation ? dateTime(r.reconciliation.at) : 'none'}.</p>
+      ${r.reconciliation ? `<details><summary>Broker / ledger observations</summary><pre>${esc(JSON.stringify(r.reconciliation,null,2))}</pre></details>` : ''}
       <div class="check"><div></div><div>Fund drawdown ${pct(f.drawdown, 1, false)} of ${pct(r.limits.fundMaxDrawdown, 0, false)} limit (auto kill switch)</div>${meter(f.drawdown, r.limits.fundMaxDrawdown)}</div>
       <div class="check"><div></div><div>Today's loss ${pct(dayLoss, 1, false)} of ${pct(r.limits.dailyLossLimit, 0, false)} limit (pauses entries)</div>${meter(dayLoss, r.limits.dailyLossLimit)}</div>
       <div class="check"><div></div><div>Gross exposure ${pct(exposure, 0, false)} of ${pct(r.limits.maxGrossExposure, 0, false)} cap (1x, no leverage)</div>${meter(exposure, r.limits.maxGrossExposure)}</div>
       <div class="check"><div></div><div>Net long ${pct(r.netLong, 0, false)} / net short ${pct(r.netShort, 0, false)}</div><div class="muted">${pct(r.netLong, 0, false)} ▲ · ${pct(r.netShort, 0, false)} ▼</div></div>
       <p class="muted">Also enforced: max ${pct(r.limits.maxSymbolExposure, 0, false)} of equity per market, a ${pct(r.limits.traderMaxDrawdown, 0, false)} per-trader drawdown retires the strategy, and entries that fight strong news are blocked. Last market data ${ago(r.lastDataAt)} ago from ${esc(s.provider)}.</p>
       <div class="actions">
-        ${r.halted ? '<button class="btn green" data-action="resume">Release kill switch</button>' : '<button class="btn red" data-action="halt">Pull kill switch</button>'}
+        ${r.halted || r.dailyReviewRequired || r.reconciliationReviewRequired ? '<button class="btn green" data-action="resume">Review acknowledged: resume entries</button>' : ''}
+        ${!r.halted ? '<button class="btn red" data-action="halt">Pull kill switch</button>' : ''}
         <button class="btn" data-action="new-season">New season (reset paper fund)</button>
       </div>
       <h3>LLM budget</h3>
@@ -232,7 +236,7 @@ function warroom(s: WorldSnapshot): PanelView {
         </div>
         ${llm.paused ? `<p class="bad">LLM paused: ${esc(llm.pausedReason ?? 'not earning its keep')}</p><div class="actions"><button class="btn green" data-action="resume-llm">Wake the LLM back up</button></div>` : '<p class="muted">The LLM sleeps on its own when the day\'s budget is spent, or when its attributed P&L trails its cost over the rolling window. Attributed P&L counts only trades from LLM-authored strategies.</p>'}
       ` : '<p class="muted">LLM is off. Set LLM_PROVIDER and LLM_API_KEY in .env to enable Prof. Quill and the news desk.</p>'}
-      <p class="muted">The kill switch closes every position at market and blocks new entries until released. A new season backs up the current state file, then restarts with fresh paper money. Agents keep their levels.</p>
+      <p class="muted">The kill switch attempts to close every position; venue failures still require review. Daily loss pauses survive UTC midnight and restart. Resume requires fresh matching broker state and fresh market data; acknowledging review resets the daily equity baseline. A new season requires local paper execution, no open/pending positions and cleared review latches. Agents keep their levels.</p>
     `,
   };
 }

@@ -262,6 +262,12 @@ export interface FundDTO {
 }
 
 export interface RiskDTO {
+  entriesPaused: boolean;
+  entryPauseReasons: string[];
+  dailyReviewRequired: boolean;
+  reconciliationReviewRequired: boolean;
+  reconciliationCurrent: boolean;
+  reconciliation: { at:number; ok:boolean; issues:string[]; broker:{symbol:string;qty:number}[]; ledger:{symbol:string;qty:number}[]; equityGap?:number } | null;
   halted: boolean;
   haltReason: string | null;
   cooldownUntil: number | null;
@@ -271,6 +277,8 @@ export interface RiskDTO {
     fundMaxDrawdown: number;
     traderMaxDrawdown: number;
     dailyLossLimit: number;
+    unprovenTradeRisk: number;
+    maxSymbolStopRisk: number;
     maxGrossExposure: number;
     maxSymbolExposure: number;
   };

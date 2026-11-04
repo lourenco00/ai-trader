@@ -347,30 +347,37 @@ export class Ecosystem implements EcoContext {
     if (reason) await this.riskOfficer.halt(`LIVE UNPLUGGED: ${reason}`);
   }
 
-  /** Every minute pull the real account figures; every few minutes check positions agree too. */
+  /** Observe, never rewrite holdings or manufacture reconciliation P&L. */
   private async checkBroker(): Promise<void> {
-    if (this.cfg.execution !== 'alpaca' || !this.alpaca || Date.now() - this.lastBrokerCheck < 60_000) return;
+    if (this.cfg.execution === 'paper' || Date.now() - this.lastBrokerCheck < 60_000) return;
     this.lastBrokerCheck = Date.now();
+    const ledger = () => this.traders.flatMap(t => t.wallet.position ? [{ symbol: t.wallet.position.symbol, qty: t.wallet.position.qty * (t.wallet.position.side === 'short' ? -1 : 1) }] : []);
+    const before = JSON.stringify(ledger());
+    const revision = this.riskOfficer.orderRevision;
+    // An account/positions pair is not atomic: never certify a read overlapping our own orders.
+    if (this.traders.some(t => t.orderPending)) return;
     try {
-      const acct = await this.alpaca.account();
-      const prev = this.brokerAcct;
-      this.brokerAcct = { equity: acct.equity, cash: acct.cash, at: Date.now() };
-      const gap = (this.fundEquity() + this.brokerOffset) / acct.equity - 1;
-      // Report once when the ledger drifts from the account, and once when it recovers.
-      if (Math.abs(gap) > 0.01 && !(prev && Math.abs((this.fundEquity() + this.brokerOffset) / prev.equity - 1) > 0.01)) {
-        this.news('risk', `Ledger $${this.fundEquity().toFixed(2)} differs from Alpaca $${acct.equity.toFixed(2)} by ${(gap * 100).toFixed(2)}%`, { good: false });
+      if (this.cfg.execution !== 'alpaca' || !this.alpaca) throw new Error('venue reconciliation is not implemented for this execution mode; entries disabled');
+      const [acct, positions, orders] = await Promise.all([this.alpaca.account(), this.alpaca.positions(), this.alpaca.openOrders()]);
+      if (this.traders.some(t => t.orderPending) || before !== JSON.stringify(ledger()) || revision !== this.riskOfficer.orderRevision) return;
+      const issues: string[] = [];
+      if (orders.length) issues.push(`outstanding venue orders: ${orders.map(o => `${o.id} ${o.symbol} ${o.status}`).join(', ')}`);
+      const internal = ledger();
+      const broker = positions.map(p => ({ symbol:p.symbol, qty:Math.abs(p.qty) * (p.side === 'short' ? -1 : 1) }));
+      const sum = (rows: {symbol:string;qty:number}[], symbol:string) => rows.filter(p=>p.symbol===symbol).reduce((s,p)=>s+p.qty,0);
+      for (const symbol of new Set([...internal,...broker].map(p=>p.symbol))) {
+        const expected=sum(internal,symbol), actual=sum(broker,symbol);
+        if (!Number.isFinite(actual) || !Number.isFinite(expected) || Math.abs(expected-actual)>Math.max(1e-8,Math.abs(expected)*1e-6)) issues.push(`${symbol}: ledger qty ${expected}, broker qty ${actual}`);
+        if (internal.filter(p=>p.symbol===symbol).length>1) issues.push(`${symbol}: multiple ledger owners require manual review`);
       }
+      const gap = (this.fundEquity() + this.brokerOffset) - acct.equity;
+      if (!(acct.equity>0) || !Number.isFinite(acct.cash) || !Number.isFinite(gap) || Math.abs(gap)>Math.max(1,acct.equity*0.001)) issues.push(`equity gap $${gap}`);
+      this.brokerAcct = {equity:acct.equity,cash:acct.cash,at:Date.now()};
+      this.riskOfficer.updateReconciliation({at:Date.now(),ok:issues.length===0,issues,broker,ledger:internal,equityGap:gap});
+      if (issues.length) this.news('risk', `Reconciliation requires review: ${issues.join('; ')}`, {good:false});
     } catch (err) {
-      log.debug('account check failed', err);
-    }
-    try {
-      const real = new Map((await this.alpaca.positions()).map((p) => [p.symbol, p.marketValue]));
-      for (const t of this.traders) {
-        const p = t.wallet.position;
-        if (p && !real.has(p.symbol)) this.news('risk', `MISMATCH: ${t.name} thinks it holds ${p.symbol} but Alpaca has no such position`, { agentId: t.id, good: false });
-      }
-    } catch (err) {
-      log.debug('broker check failed', err);
+      this.riskOfficer.updateReconciliation({at:Date.now(),ok:false,issues:[(err as Error).message],broker:[],ledger:ledger()});
+      log.warn('broker reconciliation failed; new entries disabled', err);
     }
   }
 
@@ -404,14 +411,14 @@ export class Ecosystem implements EcoContext {
     for (const t of this.traders) {
       const p = t.wallet.position;
       if (p && !this.cfg.symbols.includes(p.symbol)) {
-        log.warn(`${t.name} held ${p.symbol} which is no longer configured; dropping the position at entry price`);
-        t.wallet.position = null;
+        this.riskOfficer.requireReview(`${t.name} still holds unconfigured ${p.symbol}; position retained, restore market data before management`);
       }
     }
     // A strategy whose market could not be restored (e.g. an explored coin that was delisted) has nothing to trade.
     for (const t of this.traders) {
       const s = t.strategy;
       if (s && !this.cfg.symbols.includes(s.symbol)) {
+        if (t.wallet.position || t.executionIntent) { t.retiringReason ??= `${s.symbol} is no longer on the map`; continue; }
         log.warn(`${t.name}'s strategy ${s.name} lost its market ${s.symbol}; retiring it`);
         this.vault.retire(s.id, `${s.symbol} is no longer on the map`, 'Its market vanished.');
         t.unassign();
@@ -434,6 +441,15 @@ export class Ecosystem implements EcoContext {
       if (!s.id.startsWith('t_') || known.has(s.id)) continue;
       const w = (s.extra as { wallet?: { cash?: number; position?: { qty: number; entryPrice: number } | null } } | undefined)?.wallet;
       const cash = Number(w?.cash) || 0;
+      if (w?.position || (s.extra as {executionIntent?:unknown})?.executionIntent) {
+        const orphan = new Trader(this, s.id, `Recovered ${s.id}`, TRADERS[0].look);
+        orphan.restore(s);
+        orphan.exitOnly = true;
+        this.traders.push(orphan);
+        this.agents.push(orphan);
+        this.riskOfficer.requireReview(`${s.id} is no longer staffed but has an open position; wallet retained for exits`);
+        continue;
+      }
       if (cash > 0) {
         this.fundState.reserve += cash;
         log.warn(`trader ${s.id} is no longer staffed; returned $${cash.toFixed(2)} to the reserve${w?.position ? ' (open position dropped at entry)' : ''}`);
@@ -504,6 +520,7 @@ export class Ecosystem implements EcoContext {
       const now = Date.now();
       const eq = this.fundEquity();
       const key = utcDayKey(now);
+      this.riskOfficer.checkDailyLoss();
       if (key !== this.fundState.dayKey) {
         this.fundState.dayKey = key;
         this.fundState.dayStartEquity = eq;
@@ -910,8 +927,13 @@ export class Ecosystem implements EcoContext {
 
   /** Start over with a fresh paper fund. The old season is backed up first. Agents keep their XP. */
   async newSeason(): Promise<string | null> {
+    if (this.riskOfficer.dailyReviewRequired || this.riskOfficer.reconciliationReviewRequired || this.riskOfficer.halted) throw new Error('Review risk and explicitly resume before resetting a season');
+    if (this.cfg.execution !== 'paper' || this.traders.some(t => t.orderPending || t.executionIntent || t.wallet.position)) throw new Error('Season reset requires local paper execution with no pending orders or open positions');
     await this.save();
     const backup = await backupFile(this.stateFile, `season-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+    // Orders and risk ticks can run during either await above. Recheck before synchronous mutation.
+    if (this.riskOfficer.dailyReviewRequired || this.riskOfficer.reconciliationReviewRequired || this.riskOfficer.halted) throw new Error('Review risk and explicitly resume before resetting a season');
+    if (this.traders.some(t => t.orderPending || t.executionIntent || t.wallet.position)) throw new Error('Cannot reset with pending orders or open positions');
     for (const t of this.traders) {
       t.wallet = { cash: 0, units: 0, position: null };
       t.unassign();
@@ -945,7 +967,13 @@ export class Ecosystem implements EcoContext {
     return backup;
   }
 
-  async save(): Promise<void> {
+  async persistExecution(): Promise<void> {
+    while (this.saving) await new Promise(resolve => setTimeout(resolve, 5));
+    await this.save(true);
+  }
+
+  async save(strict = false): Promise<void> {
+    if (strict && (!this.started || this.saving)) throw new Error('execution state cannot be persisted');
     if (this.saving || !this.started) return;
     this.saving = true;
     try {
@@ -971,6 +999,7 @@ export class Ecosystem implements EcoContext {
       await writeJsonAtomic(this.stateFile, data);
     } catch (err) {
       log.error('saving state failed', err);
+      if (strict) throw err;
     } finally {
       this.saving = false;
     }

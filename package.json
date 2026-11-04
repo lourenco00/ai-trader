@@ -12,6 +12,7 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite",
     "build": "vite build",
+    "test": "node --import tsx --test tests/*.test.ts",
     "start": "vite build && tsx server/index.ts",
     "serve": "tsx server/index.ts",
     "report": "tsx server/report.ts",
@@ -21,7 +22,7 @@
     "daily": "tsx server/daily.ts",
     "approve-live": "tsx server/approve-live.ts",
     "coin": "tsx server/coin.ts",
-    "typecheck": "tsc -p tsconfig.server.json && tsc -p web/tsconfig.json"
+    "typecheck": "tsc -p tsconfig.server.json && tsc -p web/tsconfig.json && tsc -p tsconfig.tests.json"
   },
   "dependencies": {
     "tsx": "4.23.15",

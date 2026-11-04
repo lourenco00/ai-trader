@@ -26,8 +26,12 @@ export interface Fill {
 
 export interface Broker {
   readonly mode: 'paper' | 'live';
+  entryQty?(symbol: string, qty: number): number;
   marketOrder(req: OrderRequest): Promise<Fill>;
 }
+
+/** Adapter guarantees no venue submission occurred. Never infer from message text. */
+export class NotSubmittedError extends Error {}
 
 export class PaperBroker implements Broker {
   readonly mode = 'paper' as const;

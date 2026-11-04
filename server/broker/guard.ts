@@ -1,4 +1,5 @@
 import type { Broker, Fill, OrderRequest } from './broker';
+import { NotSubmittedError } from './broker';
 
 /**
  * Wraps the real broker when live money is on. It cannot make a bad strategy good; it limits how much
@@ -16,16 +17,18 @@ export class GuardedBroker implements Broker {
     this.mode = inner.mode;
   }
 
+  entryQty(symbol: string, qty: number): number { return this.inner.entryQty?.(symbol,qty) ?? qty; }
+
   async marketOrder(req: OrderRequest): Promise<Fill> {
     const now = Date.now();
     this.recent = this.recent.filter((t) => now - t < 3_600_000);
     if (!req.closing) {
       const notional = req.qty * req.refPrice;
       if (notional > this.limits.maxOrderUsd * 1.02) {
-        throw new Error(`order exceeds live cap: $${notional.toFixed(0)} > $${this.limits.maxOrderUsd}`);
+        throw new NotSubmittedError(`order exceeds live cap: $${notional.toFixed(0)} > $${this.limits.maxOrderUsd}`);
       }
       if (this.recent.length >= this.limits.maxOrdersPerHour) {
-        throw new Error(`order exceeds live cap: ${this.limits.maxOrdersPerHour} orders in the last hour`);
+        throw new NotSubmittedError(`order exceeds live cap: ${this.limits.maxOrdersPerHour} orders in the last hour`);
       }
     }
     this.recent.push(now);

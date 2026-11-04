@@ -3,6 +3,7 @@ import type { Config } from '../config';
 import type { MarketDataProvider } from '../market/providers';
 import { logger } from '../util/log';
 import type { Broker, Fill, OrderRequest } from './broker';
+import { NotSubmittedError } from './broker';
 
 const log = logger('alpaca');
 
@@ -216,7 +217,16 @@ export class AlpacaClient {
    * Crypto buys are charged in kind, so the quantity held is a little below what was
    * bought; closing through the positions endpoint sells exactly what is there.
    */
+  entryQty(symbol: string, qty: number): number {
+    return this.cfg.assetClass(symbol) === 'stock' ? Math.floor(qty) : Math.floor(qty * 1e8) / 1e8;
+  }
+
   async submitOrder(req: OrderRequest): Promise<Fill> {
+    if (!req.closing) {
+      const qty = this.entryQty(req.symbol,req.qty);
+      if (!(qty > 0)) throw new NotSubmittedError(`alpaca: ${req.symbol} below entry lot minimum`);
+      req = {...req,qty};
+    }
     const isCrypto = this.cfg.assetClass(req.symbol) === 'crypto';
     const apiSymbol = isCrypto ? this.cryptoPair(req.symbol) : req.symbol;
     if (isCrypto && this.cfg.limitOrders && !(req.closing && req.urgent)) {
@@ -232,7 +242,7 @@ export class AlpacaClient {
     } else {
       // Stocks trade in whole shares: not every name is fractionable and a whole share is clean to close.
       const qty = isCrypto ? req.qty : Math.floor(req.qty);
-      if (!(qty > 0)) throw new Error(`alpaca: ${req.symbol} order too small for a whole share (${req.qty.toFixed(3)})`);
+      if (!(qty > 0)) throw new NotSubmittedError(`alpaca: ${req.symbol} order too small for a whole share (${req.qty.toFixed(3)})`);
       r = await this.send('POST', '/v2/orders', {
         symbol: apiSymbol,
         side: req.side,
@@ -281,8 +291,13 @@ export class AlpacaClient {
 
   private async readOrder(id: string): Promise<{ status: string; qty: number; avg: number }> {
     const r = await this.send('GET', `/v2/orders/${id}`);
+    if (r.status !== 200) throw this.orderError(`read order ${id}`, r);
     const o = r.json as { status?: string; filled_qty?: string; filled_avg_price?: string };
-    return { status: o.status ?? 'unknown', qty: Number(o.filled_qty) || 0, avg: Number(o.filled_avg_price) || 0 };
+    const qty = Number(o.filled_qty), avg = Number(o.filled_avg_price);
+    if (!o.status || !Number.isFinite(qty) || qty < 0 || (qty > 0 && (!(avg > 0) || !Number.isFinite(avg))) || (o.status === 'filled' && !(qty > 0))) {
+      throw new Error(`alpaca order ${id}: invalid execution data; outcome unresolved`);
+    }
+    return { status: o.status, qty, avg: qty > 0 ? avg : 0 };
   }
 
   /** Wait until the order is filled or the time is up, then cancel whatever is still resting. */
@@ -303,6 +318,7 @@ export class AlpacaClient {
         if (terminal.includes(o.status)) break;
       }
     }
+    if (!terminal.includes(o.status)) throw new Error(`alpaca order ${id}: unresolved cancellation; terminal status not confirmed`);
     return { qty: o.qty, avg: o.avg };
   }
 
@@ -317,7 +333,7 @@ export class AlpacaClient {
     const spread = (q.ask - q.bid) / mid;
     if (spread > 0.01) {
       if (req.closing) return null; // get out at market rather than wait on a 1%-wide book
-      throw new Error(`${req.symbol} spread too wide (${(spread * 100).toFixed(2)}%)`);
+      throw new NotSubmittedError(`${req.symbol} spread too wide (${(spread * 100).toFixed(2)}%)`);
     }
     const tick = await this.priceIncrement(apiSymbol);
     const buy = req.side === 'buy';
@@ -381,11 +397,10 @@ export class AlpacaClient {
   private async awaitFill(id: string, req: OrderRequest, isCrypto: boolean): Promise<Fill> {
     for (let i = 0; i < 20; i++) {
       await new Promise((res) => setTimeout(res, i < 5 ? 300 : 1000));
-      const r = await this.send('GET', `/v2/orders/${id}`);
-      const o = r.json as { status?: string; filled_qty?: string; filled_avg_price?: string };
+      const o = await this.readOrder(id);
       if (o.status === 'filled') {
-        const qty = Number(o.filled_qty) || req.qty;
-        const price = Number(o.filled_avg_price) || req.refPrice;
+        const qty = o.qty;
+        const price = o.avg;
         // Alpaca does not report the crypto fee; it is taken from the coins received.
         const fee = isCrypto ? price * qty * this.cfg.alpacaCryptoFee : 0;
         return { symbol: req.symbol, side: req.side, qty, price, fee, time: Date.now() };
@@ -396,7 +411,14 @@ export class AlpacaClient {
     }
     // Never leave a stray order that could fill later and put the account out of step with the ledger.
     await this.send('DELETE', `/v2/orders/${id}`).catch(() => undefined);
-    throw new Error(`alpaca order ${id} did not fill in time and was cancelled`);
+    throw new Error(`alpaca order ${id}: outcome unresolved after timeout; cancellation requested, not confirmed`);
+  }
+
+  async openOrders(): Promise<{ id: string; symbol: string; status: string }[]> {
+    const r = await this.send('GET', '/v2/orders?status=open&limit=500&nested=true');
+    if (r.status !== 200 || !Array.isArray(r.json)) throw this.orderError('open orders',r);
+    if (r.json.length >= 500) throw new Error('open orders response at limit; completeness unverified');
+    return r.json as {id:string;symbol:string;status:string}[];
   }
 
   async positions(): Promise<{ symbol: string; qty: number; marketValue: number; side: string }[]> {
@@ -454,6 +476,8 @@ export class AlpacaBroker implements Broker {
   // Orders go to a real venue, but config refuses anything except the paper account.
   readonly mode = 'live' as const;
   constructor(private client: AlpacaClient) {}
+
+  entryQty(symbol: string, qty: number): number { return this.client.entryQty(symbol,qty); }
 
   async marketOrder(req: OrderRequest): Promise<Fill> {
     if (!(req.qty > 0) || !Number.isFinite(req.qty)) throw new Error(`alpaca broker: invalid qty ${req.qty}`);

@@ -2,7 +2,7 @@
 
 A multi-agent crypto trading ecosystem with a pixel-art village UI. Research agents evolve trading strategies around the clock, trader agents run the winners on live market data with paper money, and a risk officer and fund commander keep the whole thing honest. Everything you see in the village is driven by what the agents are actually doing.
 
-It starts in **paper mode only**. There is no code path that touches real money.
+It defaults to **local paper execution**. Alpaca/OKX adapters and approval-gated live execution exist; do not infer the venue or money mode from the legacy snapshot `mode: 'paper'` label. Inspect `EXECUTION`, `ALPACA_PAPER`, `OKX_DEMO`, endpoint overrides and live approval configuration. This risk update does not enable real money.
 
 ## Quick start
 
@@ -38,11 +38,11 @@ Click buildings or villagers, drag to pan, scroll or `+`/`-` to zoom, arrow keys
 
 **Optional LLM strategist.** Set `LLM_PROVIDER` and `LLM_API_KEY` in `.env` and Prof. Quill wakes up. Every 30 minutes he sends the model the market regime, the working strategies and the recent failures, and asks for new genomes as JSON. The ideas are validated, clamped and put through the same gate; rejected ideas are handed to the evolutionary researchers as seeds. Only strategy parameters and market summaries are sent, never keys or wallet data. `openai` works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, LM Studio).
 
-**Trading.** The commander hands the best waiting strategy to an idle trader with probation capital (half a normal slot). Traders act on closed candles (default 15m) and check stops and targets on every price poll. Fills pay 0.1% fees plus 3 bps slippage each way. Every hour, allocation shifts toward traders whose NAV is growing.
+**Trading.** The commander hands the best waiting strategy to an idle trader with probation capital (half a normal slot, smaller for trials). Traders act on closed candles (default 15m) and check stops and targets on every price poll. Default local fills pay 0.1% fees plus 3 bps slippage each way; asset/venue overrides can differ. Hourly allocation cannot graduate a strategy until at least 20 forward closed fills, positive net P&L and profit factor >= 1.3. Per-trade planned stop risk remains capped at 0.1% of fund equity even after graduation.
 
 **Natural selection.** A strategy is retired to the graveyard when it loses 5% on probation, draws down 12% from its peak, has a profit factor under 0.8 after 15 trades, or goes 4 days without a trade. Waiting strategies are re-tested on fresh data every 6 hours and archived if their edge faded.
 
-**Risk.** Sarge blocks entries that would push gross exposure over 100% of equity (no leverage) or put more than 50% in one coin, pauses entries for the rest of the UTC day after a 5% daily loss, blocks entries when market data is stale, and pulls the kill switch (flatten everything, stop trading) at a 20% fund drawdown. You can pull it manually in the War Room.
+**Risk.** Standard gross exposure is capped at 100% of equity and symbol notional at 50%. Planned stop risk is capped at **0.1% fund equity per trade** and **0.25% shared per symbol**, including in-flight reservations. **One owner per symbol**, including pending entries, prevents correlated duplicate strategies and ambiguous aggregate venue exits. A **1% daily equity loss** latches a new-entry pause until explicit review/resume; UTC rollover and restored saved state do not clear it. These bounds apply to aggressive profiles too. Exits bypass entry pauses. Market-data staleness blocks entries. The existing 20% standard fund-drawdown kill switch still attempts to flatten; venue failures are not guaranteed exits. See [docs/risk-safety.md](docs/risk-safety.md) for reconciliation, review and validation limits.
 
 ## Exploring beyond the usual coins
 
@@ -57,7 +57,7 @@ Small caps are treated more harshly than BTC, on purpose: slippage rises as 24h 
 
 ## The high-activity profile
 
-`npm run hi` starts a third ecosystem (http://localhost:8789) with its own simulated $100,000, built to trade as much as the evidence allows: 10 traders, 8 researchers using 80% of a core, 15-minute candles, liquid US stocks (commission-free) plus BTC and ETH, 2x leverage, 5% reserve, wider loss limits, up to 5 trial traders at half size, idle strategies rotated out after 2 days, and stocks taking up to 60% of the explored slots. The promotion gate is the same as everywhere else; only the amount risked changes. Fills are simulated against live Alpaca and Binance prices, so it never touches your Alpaca account. Compare it with the standard fund via `npm run report` (set `DATA_DIR=./data-hi`).
+`npm run hi` starts a separate local simulated $100,000 fund (http://localhost:8789), with 24 traders, 8 researchers, up to 90% research CPU, short stock / hourly crypto candles and broader notional allowances. It retains the same 0.1% trade stop-risk cap, 0.25% symbol stop-risk cap, one symbol owner, 1% manual-review daily loss pause and forward-evidence sizing gate. Extra traders may remain idle rather than duplicate symbol exposure. Fills are local simulations against market data, not Alpaca account orders. Compare using `DATA_DIR=./data-hi npm run report`.
 
 ## Real money, and the server
 
@@ -67,11 +67,11 @@ Real money is off by default and cannot be switched on by editing .env alone. `n
 
 The Command Center tracks a Real Money License: 30+ days on real data, 100+ trades, positive net return, max drawdown under 15%, hourly Sharpe of 1.0+, and 3+ strategies profitable after 10 live trades. Treat a full license as evidence, not a guarantee. Paper fills ignore order-book depth, partial fills, funding rates, exchange downtime and withdrawal risk, and many strategies that look good for a month stop working.
 
-Going live is deliberately not implemented. Execution goes through the `Broker` interface in [server/broker/broker.ts](server/broker/broker.ts), so a live adapter (exchange API keys, order status handling, reconciliation with the exchange's balances) is a contained change. Do that only after the license is earned, and start with an amount you can afford to lose.
+Live adapters already exist; this checklist is not an authorization or proof of safety. In particular, OKX currently lacks integrated account/position reconciliation and therefore **new OKX entries fail closed**, including the niche demo profile; exits are still attempted. Do not enable live execution based on these tests.
 
 ## Running it 24/7
 
-State is saved every 30 seconds and on shutdown, and positions resume after a restart, so short interruptions are fine. For continuous operation:
+State is saved every 30 seconds and on shutdown. Each execution also awaits an atomic state checkpoint containing its intent before submission and checkpoints booking afterward. Unknown entry/exit outcomes remain blocked across restart: ordinary resume cannot clear them, even with empty broker positions. Follow the offline recovery workflow in [docs/risk-safety.md](docs/risk-safety.md); do not assume an interruption left no outstanding orders. Retiring strategies retain residual positions and retry liquidation without reentry; recovered orphan traders remain exit-only. For continuous operation:
 
 - macOS laptop: `caffeinate -i npm run serve` keeps the machine awake (run `npm run build` once first).
 - Better: a small always-on Linux box or VPS with a process supervisor such as systemd, so it restarts on crashes and reboots.

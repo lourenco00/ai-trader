@@ -22,10 +22,18 @@ export interface EntryRequest {
   symbol: string;
   notional: number;
   side: 'long' | 'short';
+  stopRisk: number;
+  unproven: boolean;
 }
 
 export interface RiskGate {
   approveEntry(req: EntryRequest): { ok: true } | { ok: false; reason: string };
+  reserveEntry(req: EntryRequest): { ok: true } | { ok: false; reason: string };
+  revalidateEntry(req: EntryRequest): { ok: true } | { ok: false; reason: string };
+  releaseEntry(traderId: string): EntryRequest | undefined;
+  retainEntry(req: EntryRequest): void;
+  orderChanged(): void;
+  requireReview(reason: string): void;
   readonly halted: boolean;
 }
 
@@ -52,6 +60,7 @@ export interface EcoContext {
   readonly fund: FundView;
   readonly board: SignalBoard;
   readonly llm: LlmClient;
+  persistExecution(): Promise<void>;
   news(kind: NewsKind, text: string, opts?: { agentId?: string; good?: boolean }): void;
   emit(e: GameEvent): void;
   levelUp(agent: Agent): void;
