@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { ShadowResearch } from './research/dsa';
 import type {
   EquityPoint,
   GameEvent,
@@ -115,6 +116,7 @@ export class Ecosystem implements EcoContext {
   readonly fund: FundView;
   readonly board = new SignalBoard();
   readonly llm: LlmClient;
+  readonly dsaResearch: ShadowResearch;
 
   private alpaca: AlpacaClient | null = null;
   private okx: OkxClient | null = null;
@@ -161,6 +163,7 @@ export class Ecosystem implements EcoContext {
   private started = false;
 
   constructor(readonly cfg: Config) {
+    this.dsaResearch = new ShadowResearch(cfg.dsa, cfg);
     if (cfg.execution === 'alpaca' || cfg.provider === 'alpaca' || cfg.universe.scanStocks) this.alpaca = new AlpacaClient(cfg);
     this.universe = new Universe(cfg);
     this.intel = new CoinIntel(cfg);
@@ -261,6 +264,7 @@ export class Ecosystem implements EcoContext {
     this.timers.push(setInterval(() => void this.save(), 30_000));
     this.scheduleResearch();
     this.started = true;
+    await this.dsaResearch.start();
     this.news('system', `The valley wakes up. Paper fund at $${this.fundEquity().toFixed(2)}, market data from ${this.feed.provider.name}`, { good: true });
     this.minuteLoop();
     void this.fastLoop();
@@ -270,6 +274,7 @@ export class Ecosystem implements EcoContext {
     for (const t of this.timers) clearInterval(t);
     if (this.researchTimer) clearTimeout(this.researchTimer);
     this.feed.stop();
+    await this.dsaResearch.stop();
     if (this.started) await this.save();
   }
 
@@ -828,6 +833,7 @@ export class Ecosystem implements EcoContext {
     const researchers = this.researchers.map((r) => r.toResearcherDTO());
     researchers.push(this.strategist.toResearcherDTO());
     return {
+      dsaResearch: this.dsaResearch.snapshot(),
       serverTime: Date.now(),
       seasonStartedAt: this.seasonStartedAt,
       mode: 'paper',

@@ -44,6 +44,14 @@ Click buildings or villagers, drag to pan, scroll or `+`/`-` to zoom, arrow keys
 
 **Risk.** Standard gross exposure is capped at 100% of equity and symbol notional at 50%. Planned stop risk is capped at **0.1% fund equity per trade** and **0.25% shared per symbol**, including in-flight reservations. **One owner per symbol**, including pending entries, prevents correlated duplicate strategies and ambiguous aggregate venue exits. A **1% daily equity loss** latches a new-entry pause until explicit review/resume; UTC rollover and restored saved state do not clear it. These bounds apply to aggressive profiles too. Exits bypass entry pauses. Market-data staleness blocks entries. The existing 20% standard fund-drawdown kill switch still attempts to flatten; venue failures are not guaranteed exits. See [docs/risk-safety.md](docs/risk-safety.md) for reconciliation, review and validation limits.
 
+## Optional external research (shadow only)
+
+The opt-in daily_stock_analysis adapter defaults to **read-only history ingestion**, with no
+analysis submission or provider spend. Validated stock-only records appear under
+`/api/state` → `dsaResearch`; they never enter SignalBoard, agents, strategies, risk or orders.
+See [setup, pinned source contract, and private sidecar instructions](docs/dsa-shadow.md).
+It is disabled by default; no sidecar is deployed or started by the normal Compose file.
+
 ## Exploring beyond the usual coins
 
 The **Explorer** (Magellan) scans every 30 minutes for markets nobody put in `SYMBOLS`:

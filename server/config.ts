@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { dsaSettings } from './research/dsa';
 import { checkLiveApproval, type LiveApproval, type LiveVenue } from './live';
 
 try {
@@ -115,6 +116,7 @@ const liveApproval: LiveApproval | null = liveVenue
   : null;
 
 export const config = {
+  dsa: dsaSettings(env),
   port: num('PORT', 8787, 1, 65535),
   host: env.HOST?.trim() || '127.0.0.1',
   dataDir: path.resolve(env.DATA_DIR?.trim() || './data'),

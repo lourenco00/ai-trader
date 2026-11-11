@@ -329,7 +329,24 @@ export interface EquityPoint {
   equity: number;
 }
 
+export interface DsaResearchSnapshot {
+  enabled: boolean;
+  running: boolean;
+  shadowOnly: true;
+  mode: 'history' | 'submit';
+  lastError: string | null;
+  attemptedToday: number;
+  budgetDay: string;
+  dailyCap: number;
+  pendingTasks: number;
+  exhaustedTasks: number;
+  ambiguousSubmissions: number;
+  records: {symbol:string;queryId:string;reportId:number|null;createdAt:number;receivedAt:number;
+    stale:boolean;action:'buy'|'add'|'hold'|'reduce'|'sell'|'watch'|'avoid'|'alert'|null;sentimentScore:number|null}[];
+}
+
 export interface WorldSnapshot {
+  dsaResearch: DsaResearchSnapshot;
   serverTime: number;
   seasonStartedAt: number;
   mode: 'paper';
