@@ -1,0 +1,38 @@
+# MANUAL, standalone optional sidecar. Not included by the normal application Compose.
+# See ../docs/dsa-shadow.md. Source must be checked out at the exact revision below.
+services:
+  dsa-shadow:
+    profiles: [dsa-shadow]
+    image: local/dsa-shadow:ef44660f00e08ce66dcd4dc4d2e700836c45e833
+    build:
+      context: ${DSA_SOURCE_DIR:?Set DSA_SOURCE_DIR to the pinned upstream checkout}
+      dockerfile: docker/Dockerfile
+    command: ["python", "main.py", "--webui-only", "--host", "0.0.0.0", "--port", "8000"]
+    restart: "no"
+    environment:
+      TZ: UTC
+      SCHEDULE_ENABLED: "false"
+      SCHEDULE_RUN_IMMEDIATELY: "false"
+      RUN_IMMEDIATELY: "false"
+      MARKET_REVIEW_ENABLED: "false"
+      REPORT_LANGUAGE: en
+    # Intentionally NO env_file: do not share trader secrets.env or provider credentials.
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - dsa-shadow-data:/app/data
+      - dsa-shadow-logs:/app/logs
+      - dsa-shadow-reports:/app/reports
+    networks:
+      dsa-shadow:
+        ipv4_address: 172.30.91.2
+networks:
+  dsa-shadow:
+    name: dsa-shadow
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.91.0/24
+volumes:
+  dsa-shadow-data:
+  dsa-shadow-logs:
+  dsa-shadow-reports:
