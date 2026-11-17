@@ -86,6 +86,16 @@ State is saved every 30 seconds and on shutdown. Each execution also awaits an a
 
 The server binds to `127.0.0.1` and has **no authentication**. If you change `HOST` to expose it, put it behind a VPN or an authenticating reverse proxy, because anyone who can reach it can pull the kill switch or reset the season.
 
+## Validation and diagnostics
+
+- [Trader entry diagnostics](docs/entry-diagnostics.md) expose why entry evaluations stop before risk approval, without changing strategy decisions.
+- [Offline account evidence audit](docs/account-audit.md): `npm run audit:account -- evidence.json`. Read-only comparisons of explicitly exported records; never repairs or authorizes trading.
+- [Frozen strategy cost stress](docs/cost-stress.md): `npm run validate:costs -- --genome frozen-genome.json --candles dataset.json --plan plan.json`. No network, paid model calls or strategy optimization.
+- [Frozen forward experiment](docs/frozen-forward.md) is an explicit opt-in, isolated local-paper experiment; disabled by default, with fixed assignments and a predeclared end.
+- [Rollout and remaining evidence requirements](docs/optimization-rollout.md) distinguish tested code from production deployment, accounting recovery and future LLM/correlation experiments.
+
+Tests exercise synthetic fixtures and fake venue boundaries, not profitability or live execution quality. Do not activate frozen mode in an existing production data directory.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Main knobs: `STARTING_CAPITAL`, `SYMBOLS` (default `BTC,ETH,SOL`), `TIMEFRAME` (`5m`/`15m`/`1h`), `DATA_PROVIDER`, `FEE_RATE`, `SLIPPAGE_BPS`, `RESEARCHERS`, `TRADERS`, `RESEARCH_CPU` (fraction of one core the lab may use), and the `LLM_*` settings. Promotion, allocation and risk thresholds live in [server/config.ts](server/config.ts).

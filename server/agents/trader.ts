@@ -1,4 +1,4 @@
-import type { Appearance, PositionDTO, Side, TradeDTO, TraderDTO } from '../../shared/types';
+import type { Appearance, EntryDecisionReason, EntryDiagnostics, PositionDTO, Side, TradeDTO, TraderDTO } from '../../shared/types';
 import { compile } from '../strategy/engine';
 import { warmupBars } from '../strategy/genome';
 import { IndicatorCache } from '../strategy/indicators';
@@ -40,6 +40,11 @@ export interface Wallet {
 }
 
 const MIN_NOTIONAL = 10;
+const ENTRY_REASONS: readonly EntryDecisionReason[] = [
+  'no-strategy', 'insufficient-history', 'no-signal', 'invalid-atr', 'unresolved-execution', 'exit-only',
+  'retiring', 'market-closed', 'invalid-size', 'minimum-notional', 'risk-rejected', 'missing-price',
+  'checkpoint-cancelled', 'submission-attempted', 'entry-filled', 'execution-unknown',
+];
 
 export class Trader extends Agent {
   wallet: Wallet = { cash: 0, units: 0, position: null };
@@ -56,6 +61,17 @@ export class Trader extends Agent {
   retiringReason: string | null = null;
   private queue: Promise<void> = Promise.resolve();
   private lastBlockedBar = 0;
+  private entryDecisions: EntryDiagnostics = { counts: {}, lastReason: null, lastAt: null };
+
+  private noteEntry(reason: EntryDecisionReason): void {
+    this.entryDecisions.counts[reason] = Math.min(Number.MAX_SAFE_INTEGER, (this.entryDecisions.counts[reason] ?? 0) + 1);
+    this.entryDecisions.lastReason = reason;
+    this.entryDecisions.lastAt = Date.now();
+  }
+
+  private entryDiagnostics(): EntryDiagnostics {
+    return { ...this.entryDecisions, counts: { ...this.entryDecisions.counts } };
+  }
 
   constructor(ctx: EcoContext, id: string, name: string, appearance: Appearance) {
     super(ctx, id, name, 'trader', 'Trader', 'markets', appearance);
@@ -161,11 +177,15 @@ export class Trader extends Agent {
 
   private async handleCandle(symbol: string): Promise<void> {
     const s = this.strategy;
-    if (!s || s.symbol !== symbol) return;
+    if (!s) { this.noteEntry('no-strategy'); return; }
+    if (s.symbol !== symbol) return;
     const g = s.genome;
     const series = this.ctx.feed.series(symbol);
     const need = Math.max(600, warmupBars(g) * 2);
-    if (series.length < warmupBars(g) + 2) return;
+    if (series.length < warmupBars(g) + 2) {
+      if (!this.wallet.position) this.noteEntry('insufficient-history');
+      return;
+    }
     const window = series.slice(-need);
     const cache = new IndicatorCache(window, 64);
     const strat = compile(cache, g);
@@ -190,41 +210,48 @@ export class Trader extends Agent {
     }
 
     if (!strat.entry(i)) {
+      this.noteEntry('no-signal');
       this.activity = `Watching ${symbol} with ${s.name}`;
       this.mood = 'neutral';
       return;
     }
-    if (!(atr > 0)) return;
+    if (!(atr > 0)) { this.noteEntry('invalid-atr'); return; }
     await this.open(s, price, atr, bar.t);
   }
 
   private async open(s: StrategyRecord, price: number, atr: number, barT: number): Promise<void> {
-    if (this.executionIntent || this.exitOnly || this.retiringReason) return;
+    if (this.executionIntent) { this.noteEntry('unresolved-execution'); return; }
+    if (this.exitOnly) { this.noteEntry('exit-only'); return; }
+    if (this.retiringReason) { this.noteEntry('retiring'); return; }
     const g = s.genome;
     if (!this.ctx.marketOpen(s.symbol)) {
+      this.noteEntry('market-closed');
       this.activity = `${s.symbol} market is closed; waiting for the open`;
       this.mood = 'sleeping';
       return;
     }
     // Leave headroom for fees and slippage so margin never exceeds cash (1x).
     const stopDistance = g.stopAtr * atr;
-    if (!(stopDistance > 0) || !Number.isFinite(stopDistance) || !(price > 0)) return;
+    if (!(stopDistance > 0) || !Number.isFinite(stopDistance) || !(price > 0)) { this.noteEntry('invalid-size'); return; }
     // No automatic per-trade risk escalation: forward proof only unlocks wallet allocation.
     const plannedNotional = Math.min(this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage,
       this.ctx.fund.equity() * this.ctx.cfg.risk.unprovenTradeRisk * price / stopDistance);
     const qty = this.ctx.broker.entryQty?.(s.symbol,plannedNotional / price) ?? plannedNotional / price;
     if (!(qty > 0) || !Number.isFinite(qty) || qty > plannedNotional / price) {
+      this.noteEntry('invalid-size');
       this.activity = `${s.symbol} entry skipped: below venue lot minimum or invalid quantity`;
       return;
     }
     const notional = qty * price;
     if (notional < MIN_NOTIONAL) {
+      this.noteEntry('minimum-notional');
       this.activity = 'Signal fired but my wallet is empty';
       return;
     }
     const entryRequest = { traderId: this.id, symbol: s.symbol, notional, side: g.side, stopRisk: qty * stopDistance, unproven: true };
     const verdict = this.ctx.risk.reserveEntry(entryRequest);
     if (!verdict.ok) {
+      this.noteEntry('risk-rejected');
       this.activity = `Entry blocked: ${verdict.reason}`;
       this.mood = 'sad';
       if (this.lastBlockedBar !== barT) {
@@ -237,34 +264,46 @@ export class Trader extends Agent {
     let fill;
     this.orderPending = true;
     this.executionIntent = {kind:'entry',symbol:s.symbol,qty,side:long ? 'buy' : 'sell',at:Date.now()};
+    let checkpointReason: EntryDecisionReason = 'checkpoint-cancelled';
     try {
       await this.ctx.persistExecution();
       if (this.exitOnly || this.retiringReason) throw new NotSubmittedError('trader became exit-only during entry checkpoint');
       if (!this.ctx.marketOpen(s.symbol)) throw new NotSubmittedError('market closed during entry checkpoint');
       const currentPrice = this.ctx.feed.price(s.symbol);
-      if (currentPrice === undefined || !(currentPrice > 0) || !Number.isFinite(currentPrice)) throw new NotSubmittedError('current entry price unavailable');
+      if (currentPrice === undefined || !(currentPrice > 0) || !Number.isFinite(currentPrice)) {
+        checkpointReason = 'missing-price';
+        throw new NotSubmittedError('current entry price unavailable');
+      }
       const currentNotional = qty * currentPrice;
       const walletBudget = this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage;
       if (currentNotional > walletBudget) throw new NotSubmittedError('wallet entry budget reduced during checkpoint');
       const authorization = this.ctx.risk.revalidateEntry({ ...entryRequest, notional: currentNotional });
       if (!authorization.ok) throw new NotSubmittedError(`authorization revoked: ${authorization.reason}`);
       // No await between the final authorization and invoking the broker.
-      fill = await this.ctx.broker.marketOrder({
-        symbol: s.symbol,
-        side: long ? 'buy' : 'sell',
-        qty,
-        refPrice: currentPrice,
-      });
+      let submission;
+      try {
+        submission = this.ctx.broker.marketOrder({
+          symbol: s.symbol,
+          side: long ? 'buy' : 'sell',
+          qty,
+          refPrice: currentPrice,
+        });
+      } finally {
+        this.noteEntry('submission-attempted');
+      }
+      fill = await submission;
     } catch (err) {
       this.orderPending = false;
       // Only an adapter's explicit no-submission guarantee is safe to release.
       if (err instanceof NotSubmittedError) {
+        this.noteEntry(checkpointReason);
         this.orderPending = true;
         await this.completeExecution();
         this.activity = `${s.symbol} entry skipped: ${(err as Error).message.slice(0, 60)}`;
         this.mood = 'neutral';
         return;
       }
+      this.noteEntry('execution-unknown');
       this.ctx.risk.requireReview(`Entry ${s.symbol}: ${(err as Error).message}`);
       throw err;
     }
@@ -284,6 +323,7 @@ export class Trader extends Agent {
       strategyId: s.id,
     };
     await this.completeExecution();
+    this.noteEntry('entry-filled');
     this.addXp(5);
     this.mood = 'excited';
     this.activity = `Opened ${g.side.toUpperCase()} ${s.symbol} @ ${fmtPrice(fill.price)}`;
@@ -461,6 +501,7 @@ export class Trader extends Agent {
       wins: this.wins,
       streak: this.streak,
       status: halted ? 'halted' : this.wallet.position ? 'in-trade' : this.strategy ? 'watching' : 'idle',
+      entryDiagnostics: this.entryDiagnostics(),
     };
   }
 
@@ -472,12 +513,16 @@ export class Trader extends Agent {
       Trades: this.trades,
       'Win rate': this.trades ? `${Math.round((this.wins / this.trades) * 100)}%` : '-',
       Streak: this.streak,
+      'Last entry decision': this.entryDecisions.lastReason ?? 'not evaluated',
+      'No-signal checks': this.entryDecisions.counts['no-signal'] ?? 0,
+      'Entry broker calls': this.entryDecisions.counts['submission-attempted'] ?? 0,
     };
   }
 
   protected saveExtra(): unknown {
     return {
       wallet: this.wallet,
+      entryDiagnostics: this.entryDiagnostics(),
       executionIntent: this.executionIntent,
       exitOnly: this.exitOnly,
       retiringReason: this.retiringReason,
@@ -494,6 +539,7 @@ export class Trader extends Agent {
   protected restoreExtra(extra: unknown): void {
     const e = extra as Partial<{
       wallet: Wallet;
+      entryDiagnostics: unknown;
       executionIntent: Trader['executionIntent'];
       exitOnly: boolean;
       retiringReason: string | null;
@@ -506,6 +552,18 @@ export class Trader extends Agent {
       streak: number;
     }>;
     if (e.wallet && Number.isFinite(e.wallet.cash)) this.wallet = e.wallet;
+    this.entryDecisions = { counts: {}, lastReason: null, lastAt: null };
+    const saved = e.entryDiagnostics as Partial<EntryDiagnostics> | null;
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      if (saved.counts && typeof saved.counts === 'object' && !Array.isArray(saved.counts)) {
+        for (const reason of ENTRY_REASONS) {
+          const count = saved.counts[reason];
+          if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) this.entryDecisions.counts[reason] = count;
+        }
+      }
+      if (ENTRY_REASONS.includes(saved.lastReason as EntryDecisionReason)) this.entryDecisions.lastReason = saved.lastReason!;
+      if (typeof saved.lastAt === 'number' && Number.isSafeInteger(saved.lastAt) && saved.lastAt > 0) this.entryDecisions.lastAt = saved.lastAt;
+    }
     this.executionIntent = e.executionIntent ?? null;
     this.exitOnly = e.exitOnly === true;
     this.retiringReason = e.retiringReason ?? null;

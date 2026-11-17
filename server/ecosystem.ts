@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { freeze, hasFrozenEnrollment, validateFrozenConfig, type FrozenManifest } from './validation/frozen';
 import { ShadowResearch } from './research/dsa';
 import type {
   EquityPoint,
@@ -64,6 +65,8 @@ interface LlmAttribution {
 
 interface SaveFile {
   version: 1;
+  executionMode?: Config['execution'];
+  frozenFingerprint?: string;
   savedAt: number;
   seasonStartedAt: number;
   fund: FundState;
@@ -161,8 +164,17 @@ export class Ecosystem implements EcoContext {
   private tradesFile: string;
   private saving = false;
   private started = false;
+  private frozenManifest: FrozenManifest | null = null;
 
   constructor(readonly cfg: Config) {
+    validateFrozenConfig(cfg);
+    if (cfg.frozen?.enabled && (cfg.execution !== 'paper' || cfg.live.enabled || cfg.live.approval || cfg.live.venue)) {
+      throw new Error('frozen experiments require local paper execution, never an active venue');
+    }
+    if (cfg.frozen?.enabled) {
+      this.cfg = cfg = { ...cfg, dataDir: cfg.frozen.dataDir, llm: { ...cfg.llm, enabled: false }, news: { ...cfg.news, enabled: false },
+        dsa: { ...cfg.dsa, enabled: false }, universe: { ...cfg.universe, scanEnabled: false, scanStocks: false } };
+    }
     this.dsaResearch = new ShadowResearch(cfg.dsa, cfg);
     if (cfg.execution === 'alpaca' || cfg.provider === 'alpaca' || cfg.universe.scanStocks) this.alpaca = new AlpacaClient(cfg);
     this.universe = new Universe(cfg);
@@ -221,6 +233,9 @@ export class Ecosystem implements EcoContext {
 
   async start(): Promise<void> {
     const saved = await readJson<SaveFile>(this.stateFile);
+    if (!this.cfg.frozen?.enabled && (saved?.frozenFingerprint || await hasFrozenEnrollment(this.cfg.dataDir))) {
+      throw new Error('frozen experiment directory cannot activate as a normal fund');
+    }
     if (saved && saved.version === 1) {
       this.fundState = { ...freshFund(saved.fund.startingCapital), ...saved.fund };
       this.vault.restore(saved.strategies ?? []);
@@ -241,8 +256,12 @@ export class Ecosystem implements EcoContext {
     if (this.okx) await this.okx.init();
     if (!saved && this.cfg.execution === 'alpaca' && this.alpaca) await this.fundFromAlpaca();
     const savedExplored = this.universe.restoreFacts(saved?.universe);
-    await this.feed.start();
-    await this.rehydrateUniverse(savedExplored);
+    if (this.cfg.frozen?.enabled) {
+      for (const e of savedExplored) this.universe.add(e);
+    } else {
+      await this.feed.start();
+      await this.rehydrateUniverse(savedExplored);
+    }
     this.createAgents();
     if (saved?.agents) {
       const byId = new Map(saved.agents.map((a) => [a.id, a]));
@@ -251,6 +270,14 @@ export class Ecosystem implements EcoContext {
         if (s) a.restore(s);
       }
       this.reclaimOrphanWallets(saved.agents);
+    }
+    if (this.cfg.frozen?.enabled) {
+      this.frozenManifest = await freeze(this, saved);
+      this.board.restore([]);
+      delete this.unlocked.graduate;
+      this.enforceFrozenEnd();
+      await this.save(true, true);
+      await this.feed.start();
     }
     this.reconcile();
     this.scout.init();
@@ -262,9 +289,9 @@ export class Ecosystem implements EcoContext {
     this.timers.push(setInterval(() => void this.fastLoop(), 15_000));
     this.timers.push(setInterval(() => this.minuteLoop(), 60_000));
     this.timers.push(setInterval(() => void this.save(), 30_000));
-    this.scheduleResearch();
+    if (!this.cfg.frozen?.enabled) this.scheduleResearch();
     this.started = true;
-    await this.dsaResearch.start();
+    if (!this.cfg.frozen?.enabled) await this.dsaResearch.start();
     this.news('system', `The valley wakes up. Paper fund at $${this.fundEquity().toFixed(2)}, market data from ${this.feed.provider.name}`, { good: true });
     this.minuteLoop();
     void this.fastLoop();
@@ -281,6 +308,14 @@ export class Ecosystem implements EcoContext {
   private createAgents(): void {
     const cfg = this.cfg;
     this.riskOfficer = new RiskOfficer(this, STAFF.risk.id, STAFF.risk.name, STAFF.risk.look, this.traders, this.fundState);
+    if (cfg.frozen?.enabled) {
+      // Reservation approval and post-persistence revalidation both check the
+      // immutable deadline. Ordinary risk resume cannot grant an extension.
+      for (const name of ['approveEntry', 'revalidateEntry'] as const) {
+        const check = this.riskOfficer[name].bind(this.riskOfficer);
+        this.riskOfficer[name] = req => { this.enforceFrozenEnd(); return check(req); };
+      }
+    }
     for (const t of TRADERS.slice(0, cfg.traders)) this.traders.push(new Trader(this, t.id, t.name, t.look));
     RESEARCHERS.slice(0, cfg.researchers).forEach((r, i) => {
       this.researchers.push(new Researcher(this, r.id, r.name, r.look, r.specialty, i));
@@ -467,12 +502,13 @@ export class Ecosystem implements EcoContext {
   // -------------------------------------------------------------------------
 
   private onTick(): void {
+    this.enforceFrozenEnd();
     for (const t of this.traders) void t.onTick();
     void this.riskOfficer.check().then(() => this.trackDrawdown());
   }
 
   private onCandle(symbol: string): void {
-    this.scout.onCandle(symbol);
+    if (!this.cfg.frozen?.enabled) this.scout.onCandle(symbol);
     for (const t of this.traders) void t.onCandle(symbol);
   }
 
@@ -485,8 +521,9 @@ export class Ecosystem implements EcoContext {
 
   private async fastLoop(): Promise<void> {
     try {
-      this.enforceLlmEarnings();
+      if (!this.cfg.frozen?.enabled) this.enforceLlmEarnings();
       await this.commander.tick();
+      if (this.cfg.frozen?.enabled) return;
       this.strategist.tick();
       this.explorer.tick();
       await Promise.all(this.analysts.map((a) => a.tick()));
@@ -522,6 +559,7 @@ export class Ecosystem implements EcoContext {
 
   private minuteLoop(): void {
     try {
+      this.enforceFrozenEnd();
       const now = Date.now();
       const eq = this.fundEquity();
       const key = utcDayKey(now);
@@ -576,6 +614,7 @@ export class Ecosystem implements EcoContext {
   }
 
   private scheduleResearch(): void {
+    if (this.cfg.frozen?.enabled) return;
     const slice = 15;
     const rest = Math.max(5, slice / this.cfg.researchCpu - slice);
     const loop = () => {
@@ -701,6 +740,7 @@ export class Ecosystem implements EcoContext {
 
   /** `forExit`: stops and exits keep working until the real close; only new entries stop early. */
   marketOpen(symbol: string, forExit = false): boolean {
+    if (!forExit && this.enforceFrozenEnd()) return false;
     if (this.cfg.assetClass(symbol) === 'crypto') return true;
     // Stocks: trust the cached Alpaca clock; default open if we have not polled yet.
     return this.stockMarketOpen && (forExit || !this.closingSoon());
@@ -787,6 +827,8 @@ export class Ecosystem implements EcoContext {
   }
 
   private graduationChecks() {
+    if (this.cfg.frozen?.enabled) return [{ id: 'frozen_experiment', label: 'Frozen experiment: never automatic live approval',
+      current: 0, target: 1, display: 'independent review required; experiment cannot graduate', passed: false }];
     const eq = this.fundEquity();
     return graduation({
       seasonStartedAt: this.seasonStartedAt,
@@ -823,6 +865,12 @@ export class Ecosystem implements EcoContext {
   }
 
   snapshot(): WorldSnapshot {
+    const expired = this.enforceFrozenEnd();
+    const risk = this.riskOfficer.toRiskDTO();
+    if (expired) {
+      risk.entriesPaused = true;
+      risk.entryPauseReasons.push('frozen experiment end reached; no extension through resume');
+    }
     const eq = this.fundEquity();
     const f = this.fundState;
     const unrealized = this.traders.reduce((s, t) => s + t.unrealized(), 0);
@@ -833,6 +881,9 @@ export class Ecosystem implements EcoContext {
     const researchers = this.researchers.map((r) => r.toResearcherDTO());
     researchers.push(this.strategist.toResearcherDTO());
     return {
+      frozenExperiment: this.frozenManifest ? { version: this.frozenManifest.version, fingerprint: this.frozenManifest.fingerprint,
+        startedAt: this.frozenManifest.startedAt, endAt: this.frozenManifest.endAt, criteria: this.frozenManifest.criteria,
+        expired: Date.now() >= this.frozenManifest.endAt, realDataForward: this.cfg.provider !== 'sim' && this.feed.provider.name !== 'sim' } : null,
       dsaResearch: this.dsaResearch.snapshot(),
       serverTime: Date.now(),
       seasonStartedAt: this.seasonStartedAt,
@@ -863,7 +914,7 @@ export class Ecosystem implements EcoContext {
         grossExposure: this.fund.grossExposure(),
         openPositions: this.traders.filter((t) => t.wallet.position).length,
       },
-      risk: this.riskOfficer.toRiskDTO(),
+      risk,
       markets: this.scout.markets(),
       agents: this.agents.map((a) => a.toDTO()),
       traders: this.traders.map((t) => t.toTraderDTO(eq, halted)),
@@ -920,11 +971,13 @@ export class Ecosystem implements EcoContext {
 
   resume(): void {
     this.riskOfficer.resume();
+    this.enforceFrozenEnd();
     this.commander.assignIdle();
   }
 
   /** Manually wake the LLM agents after an earn-your-keep pause. */
   resumeLlm(): void {
+    if (this.cfg.frozen?.enabled) return;
     if (!this.llmBudget.paused) return;
     this.llmBudget.paused = false;
     this.llmPausedReason = null;
@@ -933,6 +986,7 @@ export class Ecosystem implements EcoContext {
 
   /** Start over with a fresh paper fund. The old season is backed up first. Agents keep their XP. */
   async newSeason(): Promise<string | null> {
+    if (this.cfg.frozen?.enabled) throw new Error('frozen experiment cannot reset its season');
     if (this.riskOfficer.dailyReviewRequired || this.riskOfficer.reconciliationReviewRequired || this.riskOfficer.halted) throw new Error('Review risk and explicitly resume before resetting a season');
     if (this.cfg.execution !== 'paper' || this.traders.some(t => t.orderPending || t.executionIntent || t.wallet.position)) throw new Error('Season reset requires local paper execution with no pending orders or open positions');
     await this.save();
@@ -973,18 +1027,27 @@ export class Ecosystem implements EcoContext {
     return backup;
   }
 
+  /** Entry-only pause: deliberately not halt(), which would force liquidation. */
+  private enforceFrozenEnd(): boolean {
+    if (!this.frozenManifest || Date.now() < this.frozenManifest.endAt) return false;
+    if (!this.riskOfficer.reconciliationReviewRequired) this.riskOfficer.requireReview('frozen experiment end reached; new entries disabled permanently, exits remain available');
+    return true;
+  }
+
   async persistExecution(): Promise<void> {
     while (this.saving) await new Promise(resolve => setTimeout(resolve, 5));
     await this.save(true);
   }
 
-  async save(strict = false): Promise<void> {
-    if (strict && (!this.started || this.saving)) throw new Error('execution state cannot be persisted');
-    if (this.saving || !this.started) return;
+  async save(strict = false, initializing = false): Promise<void> {
+    if (strict && ((!this.started && !initializing) || this.saving)) throw new Error('execution state cannot be persisted');
+    if (this.saving || (!this.started && !initializing)) return;
     this.saving = true;
     try {
       const data: SaveFile = {
         version: 1,
+        executionMode: this.cfg.execution,
+        frozenFingerprint: this.frozenManifest?.fingerprint,
         savedAt: Date.now(),
         seasonStartedAt: this.seasonStartedAt,
         fund: this.fundState,

@@ -60,6 +60,10 @@ export class Commander extends Agent {
       return;
     }
     await this.review();
+    if (this.ctx.cfg.frozen?.enabled) {
+      this.activity = 'Frozen experiment: risk and retirement only';
+      return;
+    }
     this.assignIdle();
     this.upgradeUntested();
     const now = Date.now();
@@ -77,6 +81,7 @@ export class Commander extends Agent {
   }
 
   assignIdle(): void {
+    if (this.ctx.cfg.frozen?.enabled) return;
     if (this.ctx.risk.halted) return;
     for (const t of this.traders) {
       if (t.strategy || t.orderPending || t.wallet.position || t.exitOnly || t.retiringReason || t.executionIntent) continue;
@@ -110,6 +115,7 @@ export class Commander extends Agent {
    * At most one swap per tick keeps it calm.
    */
   upgradeUntested(): void {
+    if (this.ctx.cfg.frozen?.enabled) return;
     if (this.ctx.risk.halted) return;
     const waiting = this.ctx.vault.byStatus('vault');
     for (const t of this.traders) {
@@ -137,6 +143,7 @@ export class Commander extends Agent {
 
   /** Score-weighted allocation. Only flat traders are resized so open positions keep their margin. */
   rebalance(): void {
+    if (this.ctx.cfg.frozen?.enabled) return;
     const a = this.ctx.cfg.allocation;
     const equity = this.ctx.fund.equity();
     const base = this.baseFraction();
@@ -190,7 +197,7 @@ export class Commander extends Agent {
       if (t.retiringReason) { await this.retire(t,t.retiringReason); continue; }
       const live = s.live;
       // A trial that proves itself live earns full status and full-size capital.
-      if (s.trial && live.trades >= this.ctx.cfg.allocation.probationTrades && live.pnl > 0 && live.grossLoss > 0 && live.grossWin / live.grossLoss >= 1.3 && t.navSinceAssign() > 1) {
+      if (!this.ctx.cfg.frozen?.enabled && s.trial && live.trades >= this.ctx.cfg.allocation.probationTrades && live.pnl > 0 && live.grossLoss > 0 && live.grossWin / live.grossLoss >= 1.3 && t.navSinceAssign() > 1) {
         s.trial = false;
         this.addXp(20);
         this.ctx.news('allocation', `"${s.name}" (${s.symbol}) passed its trial live: profit factor ${(live.grossWin / live.grossLoss).toFixed(2)} over ${live.trades} trades. Full status`, { agentId: this.id, good: true });
@@ -228,6 +235,7 @@ export class Commander extends Agent {
 
   /** Re-test waiting strategies on fresh data; drop the ones whose edge faded. */
   revalidateVault(): void {
+    if (this.ctx.cfg.frozen?.enabled) return;
     const waiting = this.ctx.vault.byStatus('vault').filter((s) => Date.now() - s.createdAt > 6 * 3_600_000);
     let dropped: StrategyRecord[] = [];
     for (const s of waiting) {

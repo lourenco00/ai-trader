@@ -116,6 +116,13 @@ const liveApproval: LiveApproval | null = liveVenue
   : null;
 
 export const config = {
+  frozen: {
+    enabled: bool('FROZEN_FORWARD_ENABLED', false),
+    dataDir: env.FROZEN_DATA_DIR?.trim() ? path.resolve(env.FROZEN_DATA_DIR.trim()) : '',
+    strategyIds: (env.FROZEN_STRATEGY_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    endAt: Date.parse(env.FROZEN_END_AT ?? ''),
+    criteria: env.FROZEN_CRITERIA?.trim() || '',
+  },
   dsa: dsaSettings(env),
   port: num('PORT', 8787, 1, 65535),
   host: env.HOST?.trim() || '127.0.0.1',
