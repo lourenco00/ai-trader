@@ -62,6 +62,7 @@ export class Trader extends Agent {
   private queue: Promise<void> = Promise.resolve();
   private lastBlockedBar = 0;
   private entryDecisions: EntryDiagnostics = { counts: {}, lastReason: null, lastAt: null };
+  private lastSizing?: EntryDiagnostics['lastSizing'];
 
   private noteEntry(reason: EntryDecisionReason): void {
     this.entryDecisions.counts[reason] = Math.min(Number.MAX_SAFE_INTEGER, (this.entryDecisions.counts[reason] ?? 0) + 1);
@@ -70,7 +71,8 @@ export class Trader extends Agent {
   }
 
   private entryDiagnostics(): EntryDiagnostics {
-    return { ...this.entryDecisions, counts: { ...this.entryDecisions.counts } };
+    return { ...this.entryDecisions, counts: { ...this.entryDecisions.counts },
+      ...(this.lastSizing ? { lastSizing: { ...this.lastSizing } } : {}) };
   }
 
   constructor(ctx: EcoContext, id: string, name: string, appearance: Appearance) {
@@ -234,9 +236,22 @@ export class Trader extends Agent {
     const stopDistance = g.stopAtr * atr;
     if (!(stopDistance > 0) || !Number.isFinite(stopDistance) || !(price > 0)) { this.noteEntry('invalid-size'); return; }
     // No automatic per-trade risk escalation: forward proof only unlocks wallet allocation.
-    const plannedNotional = Math.min(this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage,
-      this.ctx.fund.equity() * this.ctx.cfg.risk.unprovenTradeRisk * price / stopDistance);
+    const walletNotionalLimit = this.wallet.cash * Math.min(g.sizePct, 0.99) * this.ctx.cfg.risk.leverage;
+    const riskNotionalLimit = this.ctx.fund.equity() * this.ctx.cfg.risk.unprovenTradeRisk * price / stopDistance;
+    const plannedNotional = Math.min(walletNotionalLimit, riskNotionalLimit);
     const qty = this.ctx.broker.entryQty?.(s.symbol,plannedNotional / price) ?? plannedNotional / price;
+    // Observational only: never sanitize or resize the execution quantity.
+    const requestedQty = plannedNotional / price;
+    const actualNotional = qty * price;
+    const plannedStopRisk = qty * stopDistance;
+    this.lastSizing = [price, stopDistance, walletNotionalLimit, riskNotionalLimit, requestedQty, qty, actualNotional, plannedStopRisk]
+      .every((value) => Number.isFinite(value) && value >= 0) && qty <= requestedQty ? {
+      symbol: s.symbol, strategyId: s.id, evaluatedAt: Date.now(), referencePrice: price, stopDistance,
+      walletNotionalLimit, riskNotionalLimit, requestedQty, roundedQty: qty,
+      actualNotional, plannedStopRisk,
+      bindingLimit: walletNotionalLimit === riskNotionalLimit ? 'both' : walletNotionalLimit < riskNotionalLimit ? 'wallet' : 'risk',
+      venueRounded: qty !== requestedQty,
+    } : undefined;
     if (!(qty > 0) || !Number.isFinite(qty) || qty > plannedNotional / price) {
       this.noteEntry('invalid-size');
       this.activity = `${s.symbol} entry skipped: below venue lot minimum or invalid quantity`;
@@ -522,7 +537,7 @@ export class Trader extends Agent {
   protected saveExtra(): unknown {
     return {
       wallet: this.wallet,
-      entryDiagnostics: this.entryDiagnostics(),
+      entryDiagnostics: { ...this.entryDecisions, counts: { ...this.entryDecisions.counts } },
       executionIntent: this.executionIntent,
       exitOnly: this.exitOnly,
       retiringReason: this.retiringReason,
@@ -553,6 +568,7 @@ export class Trader extends Agent {
     }>;
     if (e.wallet && Number.isFinite(e.wallet.cash)) this.wallet = e.wallet;
     this.entryDecisions = { counts: {}, lastReason: null, lastAt: null };
+    this.lastSizing = undefined;
     const saved = e.entryDiagnostics as Partial<EntryDiagnostics> | null;
     if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
       if (saved.counts && typeof saved.counts === 'object' && !Array.isArray(saved.counts)) {

@@ -24,6 +24,28 @@ Saved trader extras include a deep-copy diagnostics object. Old snapshots withou
 
 These are best-effort telemetry persisted with ordinary state, not a durable order journal. A crash between booking and the next save can lose diagnostic counts; do not use them to reconstruct fills, prove exactly-once execution or clear unresolved execution.
 
+## Last sizing evaluation
+
+The optional `lastSizing` snapshot explains the most recent initial entry-sizing
+evaluation: the wallet/allocation ceiling, planned-stop-risk ceiling, requested
+quantity, venue-rounded quantity, actual reference-price notional, planned stop
+risk and which of the two sizing ceilings bound the request. Venue rounding is
+reported separately. Exposure and reconciliation rejections remain risk decisions,
+not fictitious sizing constraints.
+
+This is **not a fill or approval**. Its symbol, strategy and evaluation timestamp
+identify the original observation; a later no-signal evaluation or strategy
+assignment does not turn it into a new plan. Prices and wallet capacity can change
+during the existing checkpoint and final authorization. Use actual order/fill
+records for what was submitted or executed.
+
+These explanations are ephemeral: they start absent and are not restored from
+saved state. Existing persisted reason counters are unchanged. Snapshot consumers
+receive a copy, not access to the trader's internal object. Invalid/non-finite
+values do not become valid-looking numeric explanations. The observation does not
+round again, change the chosen quantity, loosen risk checks or insert an await
+into execution.
+
 ## Verification
 
 `node --import tsx --test tests/entry-diagnostics.test.ts` exercises actual Trader candle/open methods against deterministic synthetic candles and a fake broker. Four early candle reasons and seven signal-path skips were each observed failing before instrumentation, then passing; post-checkpoint missing price and broker-invocation/booking counters also failed before implementation. Save/restore initially failed before additive persistence was added. Revoked authorization and ambiguous failures retain existing safety behavior. The original real risk/trader checkpoint, guard and fake-Alpaca regression suite must also pass before publication.
