@@ -52,6 +52,16 @@ analysis submission or provider spend. Validated stock-only records appear under
 See [setup, pinned source contract, and private sidecar instructions](docs/dsa-shadow.md).
 It is disabled by default; no sidecar is deployed or started by the normal Compose file.
 
+## Optional technical setup watchlist (observation only)
+
+A disabled-by-default Research Lab watchlist identifies 20-bar closing breakouts,
+SMA20 reclaims and RSI14 oversold/bounce conditions using the fund's existing
+completed candles. It labels the actual timeframe, distinguishes unusable data
+from no matches, and never changes signals, strategies, risk, sizing or orders.
+It adds no market-data provider or paid calls. Set `SETUP_WATCHLIST_ENABLED=true`
+only to observe; frozen experiments suppress it.
+See [rules, source attribution, retained controls and limitations](docs/setup-watchlist.md).
+
 ## Exploring beyond the usual coins
 
 The **Explorer** (Magellan) scans every 30 minutes for markets nobody put in `SYMBOLS`:

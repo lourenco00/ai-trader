@@ -115,7 +115,13 @@ const liveApproval: LiveApproval | null = liveVenue
   ? checkLiveApproval({ file: env.LIVE_APPROVAL_FILE?.trim() || undefined, venue: liveVenue, dataDir: env.DATA_DIR?.trim() || './data' })
   : null;
 
+const setupWatchlistRaw = env.SETUP_WATCHLIST_ENABLED;
+if (setupWatchlistRaw !== undefined && setupWatchlistRaw !== 'true' && setupWatchlistRaw !== 'false') {
+  throw new Error('config: SETUP_WATCHLIST_ENABLED must be true or false');
+}
+
 export const config = {
+  setupWatchlistEnabled: setupWatchlistRaw === 'true',
   frozen: {
     enabled: bool('FROZEN_FORWARD_ENABLED', false),
     dataDir: env.FROZEN_DATA_DIR?.trim() ? path.resolve(env.FROZEN_DATA_DIR.trim()) : '',

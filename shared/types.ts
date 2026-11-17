@@ -145,10 +145,28 @@ export type EntryDecisionReason = 'no-strategy' | 'insufficient-history' | 'no-s
   'unresolved-execution' | 'exit-only' | 'retiring' | 'market-closed' | 'invalid-size' | 'minimum-notional' |
   'risk-rejected' | 'missing-price' | 'checkpoint-cancelled' | 'submission-attempted' | 'entry-filled' | 'execution-unknown';
 
+export interface EntrySizingDiagnostics {
+  symbol: string;
+  strategyId: string;
+  evaluatedAt: number;
+  referencePrice: number;
+  stopDistance: number;
+  walletNotionalLimit: number;
+  riskNotionalLimit: number;
+  requestedQty: number;
+  roundedQty: number;
+  actualNotional: number;
+  plannedStopRisk: number;
+  bindingLimit: 'wallet' | 'risk' | 'both';
+  venueRounded: boolean;
+}
+
 export interface EntryDiagnostics {
   counts: Partial<Record<EntryDecisionReason, number>>;
   lastReason: EntryDecisionReason | null;
   lastAt: number | null;
+  /** Initial pre-reservation sizing, not a fill/approval. Ephemeral: resets on restart. */
+  lastSizing?: EntrySizingDiagnostics;
 }
 
 export interface TraderDTO {
@@ -356,7 +374,23 @@ export interface DsaResearchSnapshot {
     stale:boolean;action:'buy'|'add'|'hold'|'reduce'|'sell'|'watch'|'avoid'|'alert'|null;sentimentScore:number|null}[];
 }
 
+export interface SetupWatchlistSnapshot {
+  researchOnly: true;
+  status: 'disabled' | 'enabled';
+  rows: SetupWatchRow[];
+}
+
+export interface SetupWatchRow {
+  symbol: string;
+  timeframeMs: number;
+  asOf: number | null;
+  bars: number;
+  status: 'match' | 'no-match' | 'insufficient-history' | 'invalid-data' | 'stale' | 'unsupported';
+  setups: string[];
+}
+
 export interface WorldSnapshot {
+  setupWatchlist?: SetupWatchlistSnapshot;
   frozenExperiment?: {
     version: 1;
     fingerprint: string;

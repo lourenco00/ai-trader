@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { freeze, hasFrozenEnrollment, validateFrozenConfig, type FrozenManifest } from './validation/frozen';
 import { ShadowResearch } from './research/dsa';
+import { setupWatchlist } from './research/setups';
 import type {
   EquityPoint,
   GameEvent,
@@ -884,6 +885,7 @@ export class Ecosystem implements EcoContext {
       frozenExperiment: this.frozenManifest ? { version: this.frozenManifest.version, fingerprint: this.frozenManifest.fingerprint,
         startedAt: this.frozenManifest.startedAt, endAt: this.frozenManifest.endAt, criteria: this.frozenManifest.criteria,
         expired: Date.now() >= this.frozenManifest.endAt, realDataForward: this.cfg.provider !== 'sim' && this.feed.provider.name !== 'sim' } : null,
+      setupWatchlist: setupWatchlist(this.cfg, this.feed),
       dsaResearch: this.dsaResearch.snapshot(),
       serverTime: Date.now(),
       seasonStartedAt: this.seasonStartedAt,

@@ -168,6 +168,11 @@ function lab(s: WorldSnapshot): PanelView {
       </div>
       <div class="note">How a strategy gets promoted: it is scored on three separate stretches of the training data (the worst stretch counts most), then must pass an untouched holdout of the most recent ${pct(s.gate.holdoutFraction, 0, false)} of history: return above ${pct(s.gate.minTestReturn, 1, false)}, Sharpe above ${s.gate.minTestSharpe}, profit factor above ${s.gate.minProfitFactor} and drawdown under ${pct(s.gate.maxTestDrawdown, 0, false)}, after ${pct(s.gate.feeRate, 2, false)} fees and ${pct(s.gate.slippage, 2, false)} slippage per fill. Only the best candidate per epoch can be promoted. Some winners will still be luck, so each one starts on small probation capital.</div>
       ${s.llmEnabled ? '' : '<p class="muted">Prof. Quill is asleep. Add LLM_PROVIDER and LLM_API_KEY to .env to let an LLM propose strategy ideas that go through the same tests.</p>'}
+      <h3>Technical setup watchlist — Research-only</h3>
+      <p class="muted">Chart observations, not trade recommendations. No daily aggregation or opening-range inference. Needs 30 completed bars; at most 250 input bars and 50 configured markets. Observations become stale after 3 candle intervals; stock closures may show stale.</p>
+      ${s.setupWatchlist?.status === 'enabled'
+        ? `<table><thead><tr><th>Market</th><th>Timeframe</th><th>Completed as of</th><th>Status</th><th>Observations</th></tr></thead><tbody>${s.setupWatchlist.rows.map(row => `<tr><td>${esc(row.symbol)}</td><td>${esc(String(row.timeframeMs / 60_000))} min/bar</td><td>${row.asOf === null ? '-' : dateTime(row.asOf)}</td><td>${esc(row.status)}</td><td>${row.setups.map(esc).join(', ') || '-'}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="muted">Disabled. Set SETUP_WATCHLIST_ENABLED=true to observe existing market candles. Frozen experiments always suppress it.</p>'}
       <table><thead><tr><th>Researcher</th><th>Market</th><th>Progress</th><th>Tested</th><th>Found</th><th>Best</th><th>Latest</th></tr></thead><tbody>${rows}</tbody></table>
     `,
   };
@@ -387,6 +392,13 @@ export function agentPanel(a: AgentDTO, s: WorldSnapshot): PanelView {
     const p = t.position;
     extra = `<h3>Open position</h3><p>${p.side.toUpperCase()} ${p.qty.toPrecision(4)} ${esc(p.symbol)} @ ${price(p.entryPrice)}, mark ${price(p.markPrice)}, stop ${price(p.stop)}${p.takeProfit ? `, target ${price(p.takeProfit)}` : ''}: <span class="${cls(p.unrealizedPnl)}">${money(p.unrealizedPnl, true)}</span></p>`;
   }
+  const sizing = t?.entryDiagnostics?.lastSizing;
+  if (sizing) extra += `<h3>Last sizing evaluation (not a fill or approval)</h3>
+    <p>${esc(sizing.symbol)} · strategy ${esc(sizing.strategyId)} · as of ${esc(new Date(sizing.evaluatedAt).toISOString())}</p>
+    <p>Reference price: ${price(sizing.referencePrice)} · Stop distance: ${price(sizing.stopDistance)}<br>
+    Wallet ceiling: ${money(sizing.walletNotionalLimit)} · Risk ceiling: ${money(sizing.riskNotionalLimit)} · Binding limit: ${esc(sizing.bindingLimit)}<br>
+    Requested quantity: ${esc(sizing.requestedQty)} · Rounded quantity: ${esc(sizing.roundedQty)} · Venue rounded: ${sizing.venueRounded ? 'yes' : 'no'}<br>
+    Initial notional: ${money(sizing.actualNotional)} · Planned stop risk: ${money(sizing.plannedStopRisk)}</p>`;
   const strat = t?.strategyId ? s.strategies.find((x) => x.id === t.strategyId) : undefined;
   if (strat) extra += `<h3>Strategy: ${esc(strat.name)} (${esc(strat.symbol)})</h3><div class="rules">${strat.rules.map(esc).join('<br>')}</div><p>Holdout: ${metricsCell(strat.test)}</p>`;
   const r = s.researchers.find((x) => x.agentId === a.id);
