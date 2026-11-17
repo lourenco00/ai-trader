@@ -141,6 +141,16 @@ export interface TradeDTO {
   reason: string;
 }
 
+export type EntryDecisionReason = 'no-strategy' | 'insufficient-history' | 'no-signal' | 'invalid-atr' |
+  'unresolved-execution' | 'exit-only' | 'retiring' | 'market-closed' | 'invalid-size' | 'minimum-notional' |
+  'risk-rejected' | 'missing-price' | 'checkpoint-cancelled' | 'submission-attempted' | 'entry-filled' | 'execution-unknown';
+
+export interface EntryDiagnostics {
+  counts: Partial<Record<EntryDecisionReason, number>>;
+  lastReason: EntryDecisionReason | null;
+  lastAt: number | null;
+}
+
 export interface TraderDTO {
   agentId: string;
   name: string;
@@ -156,6 +166,7 @@ export interface TraderDTO {
   wins: number;
   streak: number;
   status: 'idle' | 'watching' | 'in-trade' | 'halted';
+  entryDiagnostics?: EntryDiagnostics;
 }
 
 export interface ResearcherDTO {
@@ -346,6 +357,15 @@ export interface DsaResearchSnapshot {
 }
 
 export interface WorldSnapshot {
+  frozenExperiment?: {
+    version: 1;
+    fingerprint: string;
+    startedAt: number;
+    endAt: number;
+    criteria: string;
+    expired: boolean;
+    realDataForward: boolean;
+  } | null;
   dsaResearch: DsaResearchSnapshot;
   serverTime: number;
   seasonStartedAt: number;

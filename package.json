@@ -16,6 +16,8 @@
     "start": "vite build && tsx server/index.ts",
     "serve": "tsx server/index.ts",
     "report": "tsx server/report.ts",
+    "audit:account": "tsx scripts/account-audit.ts",
+    "validate:costs": "tsx scripts/cost-stress.ts",
     "niche": "tsx server/niche.ts",
     "hi": "tsx server/hiact.ts",
     "small": "tsx server/smallcap.ts",
