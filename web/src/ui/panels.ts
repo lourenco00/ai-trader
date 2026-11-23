@@ -2,6 +2,7 @@ import type { AgentDTO, BuildingId, StrategyDTO, WorldSnapshot } from '../../../
 import { BUILDING_BY_ID } from '../world/map';
 import { drawEquity, drawSpark } from './charts';
 import { ago, cls, dateTime, esc, money, pct, price } from './format';
+import { agentReadiness, llmReadiness } from './readiness';
 
 export interface PanelView {
   title: string;
@@ -148,7 +149,7 @@ function lab(s: WorldSnapshot): PanelView {
       return `<tr class="clickable" data-action="open-agent" data-id="${esc(r.agentId)}">
         <td><b>${esc(r.name)}</b><div class="muted">${esc(r.specialty)}</div></td>
         <td>${r.enabled ? esc(r.symbol) : '<span class="muted">asleep</span>'}</td>
-        <td>${r.origin === 'llm' ? `${r.epoch} sessions` : `epoch ${r.epoch + 1}<div class="meter" style="width:90px"><i style="width:${(progress * 100).toFixed(0)}%"></i></div>`}</td>
+        <td>${r.origin === 'llm' ? `${esc(llmReadiness(s,r.agentId,r.enabled).state)} · ${r.epoch} completed sessions` : r.workState && r.workState !== 'running' ? `${esc(r.workState)} · ${r.epoch} completed epochs` : `epoch ${r.epoch + 1}<div class="meter" style="width:90px"><i style="width:${(progress * 100).toFixed(0)}%"></i></div>`}</td>
         <td>${r.evaluated.toLocaleString()}</td>
         <td>${r.discoveries}</td>
         <td>${r.bestFitness === null ? '-' : r.bestFitness.toFixed(2)}</td>
@@ -184,7 +185,7 @@ function strategyRows(s: WorldSnapshot, list: StrategyDTO[]): string {
       (st) => `<tr>
         <td><b>${esc(st.name)}</b> ${st.trial ? '<span class="tag trial" title="Positive holdout but short of the strict gate: trades small until it proves itself live">trial</span> ' : ''}<span class="muted">${esc(st.symbol)} ${st.side.toUpperCase()}</span>
           <div class="rules">${st.rules.map(esc).join('<br>')}</div></td>
-        <td>${st.status === 'active' ? `with ${agentLink(s, st.traderId)}` : 'waiting'}</td>
+        <td>${st.status === 'active' ? `with ${agentLink(s, st.traderId)}` : st.parked ? `parked — awaiting recheck<div class="muted">${esc(st.parked.reason)}</div>` : 'waiting'}</td>
         <td>${esc(st.author)}${st.origin === 'llm' ? ' (LLM)' : ''}<div class="muted">${ago(st.createdAt)} ago</div></td>
         <td>${metricsCell(st.test)}</td>
         <td>${metricsCell(st.train)}</td>
@@ -194,13 +195,21 @@ function strategyRows(s: WorldSnapshot, list: StrategyDTO[]): string {
     .join('');
 }
 
+function allocationSummary(s: WorldSnapshot): string {
+  const d = s.allocationDiagnostics;
+  if (!d) return '<p class="muted">Assignment eligibility telemetry unavailable from this server.</p>';
+  const blockers = Object.entries(d.blocked).filter(([, n]) => n > 0).map(([reason, n]) => `${esc(reason)}: ${n}`).join(' · ');
+  return `<p><b>${d.waiting} waiting · ${d.eligible} assignment-eligible now</b></p>
+    <p class="muted">${blockers || 'No waiting-shelf blockers'}. Assignment eligibility is not an entry or order approval; sizing and risk checks still apply.</p>`;
+}
+
 function vault(s: WorldSnapshot): PanelView {
   return {
     title: 'STRATEGY VAULT',
     sub: 'Strategies that passed the holdout test. Active ones are being traded; the rest wait for a free trader.',
-    html: s.strategies.length
+    html: allocationSummary(s) + (s.strategies.length
       ? `<table><thead><tr><th>Strategy</th><th>Status</th><th>Author</th><th>Holdout</th><th>Training</th><th>Live paper</th></tr></thead><tbody>${strategyRows(s, s.strategies)}</tbody></table>`
-      : '<p class="muted">Empty for now. Depending on the market, the first promotion can take minutes or hours. If nothing beats fees on the holdout, nothing gets traded, which is the point.</p>',
+      : '<p class="muted">Empty for now. Depending on the market, the first promotion can take minutes or hours. If nothing beats fees on the holdout, nothing gets traded, which is the point.</p>'),
   };
 }
 
@@ -229,17 +238,21 @@ function warroom(s: WorldSnapshot): PanelView {
         ${!r.halted ? '<button class="btn red" data-action="halt">Pull kill switch</button>' : ''}
         <button class="btn" data-action="new-season">New season (reset paper fund)</button>
       </div>
-      <h3>LLM budget</h3>
+      <h3>LLM estimated usage budget</h3>
       ${llm.enabled ? `
         <div class="grid">
           ${stat('Spent today', `${money(llm.spentToday)} <span class="muted" style="font-size:16px">/ ${money(llm.dailyBudget)}</span>`)}
-          ${stat('Total spent', money(llm.totalSpent))}
-          ${stat('Attributed P&L', money(llm.attributedPnl, true), cls(llm.attributedPnl))}
-          ${stat('Net of cost', money(llm.netOfCost, true), cls(llm.netOfCost))}
+          ${stat('Lifetime estimated usage', money(llm.totalSpent))}
+          ${stat('Lifetime direct-authored P&L', money(llm.attributedPnl, true), cls(llm.attributedPnl))}
+          ${stat('Direct P&L less all usage', money(llm.netOfCost, true), cls(llm.netOfCost))}
           ${stat('Calls', String(llm.totalCalls))}
           ${stat('Tokens', llm.totalTokens.toLocaleString())}
         </div>
-        ${llm.paused ? `<p class="bad">LLM paused: ${esc(llm.pausedReason ?? 'not earning its keep')}</p><div class="actions"><button class="btn green" data-action="resume-llm">Wake the LLM back up</button></div>` : '<p class="muted">The LLM sleeps on its own when the day\'s budget is spent, or when its attributed P&L trails its cost over the rolling window. Attributed P&L counts only trades from LLM-authored strategies.</p>'}
+        ${llm.paused ? `<p class="bad">LLM paused: ${esc(llm.pausedReason ?? 'review required')}</p>${llm.canResume === true ? '<div class="actions"><button class="btn green" data-action="resume-llm">Grant bounded LLM evaluation</button></div><p class="muted">Explicit grant: at most $0.25 additional configured-price estimated usage for up to one hour, still within the daily cap. Not an accounting or billing override.</p>' : '<p class="muted">No evaluation grant is currently available. Resolve accounting/budget/configuration review first.</p>'}` : '<p class="muted">LLM work remains subject to its configured-price estimated usage cap and matched-period direct-authored earnings review. Zero daily budget means no spending.</p>'}
+        <p class="muted">Usage costs are estimates, not provider invoices. Direct-authored P&L does not measure descendant strategies or the causal value of news.</p>
+        ${llm.window ? `<p>Matching UTC-day window ${esc(llm.window.startDay)} through ${esc(llm.window.endDay)}: authored-strategy estimated cost ${money(llm.window.strategyCost)}, direct-authored realized P&L ${money(llm.window.directAuthoredPnl,true)}, news estimated cost ${money(llm.window.newsCost)} (impact unmeasured).</p>` : ''}
+        ${llm.reservedUsd !== undefined ? `<p>Outstanding estimated usage reservations: ${money(llm.reservedUsd)}. Attempts: ${llm.attempts ?? 0}; confirmed successful responses: ${llm.successes ?? 0}.</p>` : ''}
+        ${llm.grant?.active ? `<p>Bounded grant active until ${dateTime(llm.grant.expiresAt)}; additional estimated allowance remaining ${money(llm.grant.remainingUsd)}.</p>` : ''}
       ` : '<p class="muted">LLM is off. Set LLM_PROVIDER and LLM_API_KEY in .env to enable Prof. Quill and the news desk.</p>'}
       <p class="muted">The kill switch attempts to close every position; venue failures still require review. Daily loss pauses survive UTC midnight and restart. Resume requires fresh matching broker state and fresh market data; acknowledging review resets the daily equity baseline. A new season requires local paper execution, no open/pending positions and cleared review latches. Agents keep their levels.</p>
     `,
@@ -286,7 +299,7 @@ function media(s: WorldSnapshot): PanelView {
     .map(
       (a) => `<tr class="clickable" data-action="open-agent" data-id="${esc(a.agentId)}">
         <td><b>${esc(a.name)}</b><div class="muted">${esc(a.beat)}</div></td>
-        <td>${a.enabled ? 'on duty' : '<span class="muted">asleep</span>'}</td>
+        <td>${esc(llmReadiness(s, a.agentId, a.enabled).state)}<div class="muted">${esc(llmReadiness(s, a.agentId, a.enabled).reason)}</div></td>
         <td>${a.headlinesRead.toLocaleString()}</td>
         <td>${a.signalsPosted}</td>
         <td>${a.hitRate === null ? `<span class="muted">${a.scored}/5 graded</span>` : `${Math.round(a.hitRate * 100)}% <span class="muted">(${a.scored})</span>`}</td>
@@ -336,11 +349,14 @@ function graveyard(s: WorldSnapshot): PanelView {
 }
 
 function hall(s: WorldSnapshot): PanelView {
+  const roleRanks = new Map<string, number>();
   const board = [...s.agents]
-    .sort((a, b) => b.level - a.level || b.xp - a.xp)
-    .map(
-      (a, i) => `<tr class="clickable" data-action="open-agent" data-id="${esc(a.id)}"><td>#${i + 1}</td><td><b>${esc(a.name)}</b></td><td>${esc(a.title)}</td><td>Lv ${a.level}</td><td>${a.xp.toLocaleString()} xp</td></tr>`,
-    )
+    .sort((a, b) => a.role.localeCompare(b.role) || b.xp - a.xp)
+    .map((a) => {
+      const rank = (roleRanks.get(a.role) ?? 0) + 1;
+      roleRanks.set(a.role, rank);
+      return `<tr class="clickable" data-action="open-agent" data-id="${esc(a.id)}"><td>${esc(a.role)} #${rank}</td><td><b>${esc(a.name)}</b></td><td>${esc(a.title)}</td><td>Activity Lv ${a.level}</td><td>${a.xp.toLocaleString()} activity XP</td></tr>`;
+    })
     .join('');
   const ach = s.achievements
     .map((a) => `<div class="ach ${a.unlockedAt ? 'on' : ''}"><b>${esc(a.title)}</b>${esc(a.description)}${a.unlockedAt ? `<div class="muted">${dateTime(a.unlockedAt)}</div>` : ''}</div>`)
@@ -348,12 +364,13 @@ function hall(s: WorldSnapshot): PanelView {
   const unlocked = s.achievements.filter((a) => a.unlockedAt).length;
   return {
     title: 'HALL OF FAME',
-    sub: 'Agents earn XP for testing strategies, discovering winners, trading well and keeping the fund safe.',
+    sub: 'Activity XP records work volume, not trading skill. Reward schedules differ by role; old levels are preserved.',
     html: `
       <h3>Achievements ${unlocked}/${s.achievements.length}</h3>
       <div class="achievements">${ach}</div>
-      <h3>Leaderboard</h3>
-      <table><thead><tr><th>Rank</th><th>Agent</th><th>Role</th><th>Level</th><th>XP</th></tr></thead><tbody>${board}</tbody></table>
+      <h3>Within-role activity XP</h3>
+      <p class="muted">Activity levels are not evidence of skill, profitability or permission to risk more money. Compare forward results separately.</p>
+      <table><thead><tr><th>Within-role activity</th><th>Agent</th><th>Role</th><th>Activity level</th><th>Activity XP</th></tr></thead><tbody>${board}</tbody></table>
     `,
   };
 }
@@ -382,7 +399,9 @@ export function buildingPanel(id: BuildingId, s: WorldSnapshot): PanelView {
 }
 
 export function agentPanel(a: AgentDTO, s: WorldSnapshot): PanelView {
-  const xpPct = a.xpToNext > a.xpForLevel ? (a.xp - a.xpForLevel) / (a.xpToNext - a.xpForLevel) : 1;
+  const xpPct = a.xpToNext > a.xpForLevel ? Math.max(0, Math.min(1, (a.xp - a.xpForLevel) / (a.xpToNext - a.xpForLevel))) : 1;
+  const readiness = agentReadiness(a, s);
+  const stamp = (t: number | null | undefined) => typeof t === 'number' && Number.isSafeInteger(t) && t > 0 && t <= s.serverTime + 60_000 ? dateTime(t) : 'not recorded';
   const stats = Object.entries(a.stats)
     .map(([k, v]) => `<tr><td class="muted">${esc(k)}</td><td>${esc(v)}</td></tr>`)
     .join('');
@@ -409,10 +428,12 @@ export function agentPanel(a: AgentDTO, s: WorldSnapshot): PanelView {
     sub: `${a.title}, works at the ${home.label.toLowerCase()}`,
     html: `
       <canvas class="portrait" id="portrait" width="64" height="108" aria-hidden="true"></canvas>
-      <p style="font-size:22px;margin:0">Level ${a.level} · ${a.xp.toLocaleString()} xp</p>
+      <p style="font-size:22px;margin:0">Activity level ${a.level} · ${a.xp.toLocaleString()} activity XP</p>
       <div class="xpbar" style="width:260px"><i style="width:${(xpPct * 100).toFixed(0)}%"></i></div>
-      <p class="muted" style="margin:2px 0 8px">${(a.xpToNext - a.xp).toLocaleString()} xp to level ${a.level + 1} · feeling ${esc(a.mood)}</p>
-      <p><b>Now:</b> ${esc(a.activity)}</p>
+      <p class="muted" style="margin:2px 0 8px">${Math.max(0, a.xpToNext - a.xp).toLocaleString()} activity XP to level ${a.level + 1}; not a trading-skill score</p>
+      <p><b>Status:</b> ${esc(readiness.state)} — ${esc(readiness.reason)}</p>
+      <p><b>Last reported activity:</b> ${esc(a.activity)} <span class="muted">(${stamp(a.activityAt)})</span></p>
+      <p class="muted">Last recorded work: ${stamp(a.lastWorkAt)}. Village movement is decorative, not a worker heartbeat.</p>
       <table style="clear:both"><tbody>${stats}</tbody></table>
       ${extra}
       <div class="actions"><button class="btn" data-action="follow" data-id="${esc(a.id)}">Follow in the village</button>

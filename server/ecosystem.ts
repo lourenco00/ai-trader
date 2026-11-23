@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { freeze, hasFrozenEnrollment, validateFrozenConfig, type FrozenManifest } from './validation/frozen';
+import { mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { freeze, hasFrozenEnrollment, sourceIdentity, validateFrozenConfig, type FrozenManifest } from './validation/frozen';
 import { ShadowResearch } from './research/dsa';
 import { setupWatchlist } from './research/setups';
 import type {
@@ -139,7 +140,6 @@ export class Ecosystem implements EcoContext {
   private treasurer!: Treasurer;
   private strategist!: Strategist;
   private agents: Agent[] = [];
-  private llmPausedReason: string | null = null;
   private stockMarketOpen = true;
   /** When the open US session ends (ms), from the Alpaca clock. 0 when closed or unknown. */
   private stockCloseAt = 0;
@@ -166,6 +166,7 @@ export class Ecosystem implements EcoContext {
   private saving = false;
   private started = false;
   private frozenManifest: FrozenManifest | null = null;
+  private artifactFingerprint: string | null = null;
 
   constructor(readonly cfg: Config) {
     validateFrozenConfig(cfg);
@@ -198,6 +199,7 @@ export class Ecosystem implements EcoContext {
     this.fundState = freshFund(this.capital);
     this.llmCost = freshCost();
     this.llmBudget = new LlmBudget(this.llmCost, cfg.llm.dailyBudgetUsd);
+    this.llmBudget.setPersistence(snapshot => this.saveCost(snapshot));
     this.llm = new LlmClient(cfg, this.llmBudget);
     this.stateFile = path.join(cfg.dataDir, 'state.json');
     this.tradesFile = path.join(cfg.dataDir, 'trades.jsonl');
@@ -233,7 +235,10 @@ export class Ecosystem implements EcoContext {
   // -------------------------------------------------------------------------
 
   async start(): Promise<void> {
+    // Measured source/runtime bytes, not a Git deployment claim or a broker attestation.
+    this.artifactFingerprint = await sourceIdentity().catch(() => null);
     const saved = await readJson<SaveFile>(this.stateFile);
+    await this.loadLlmCost(saved);
     if (!this.cfg.frozen?.enabled && (saved?.frozenFingerprint || await hasFrozenEnrollment(this.cfg.dataDir))) {
       throw new Error('frozen experiment directory cannot activate as a normal fund');
     }
@@ -249,7 +254,6 @@ export class Ecosystem implements EcoContext {
       this.seasonStartedAt = saved.seasonStartedAt ?? Date.now();
       this.lastEdition = saved.lastEdition ?? this.lastEdition;
       if (saved.signals) this.board.restore(saved.signals);
-      if (saved.llmCost) this.llmBudget.load({ ...freshCost(), ...saved.llmCost });
       if (saved.llmAttribution) this.llmAttribution = saved.llmAttribution;
       log.info(`restored season from ${new Date(saved.savedAt).toISOString()} (${this.vault.all().length} strategies)`);
     }
@@ -299,8 +303,10 @@ export class Ecosystem implements EcoContext {
   }
 
   async stop(): Promise<void> {
+    this.llmBudget.stop();
     for (const t of this.timers) clearInterval(t);
     if (this.researchTimer) clearTimeout(this.researchTimer);
+    for (const researcher of this.researchers) researcher.cancelResearch();
     this.feed.stop();
     await this.dsaResearch.stop();
     if (this.started) await this.save();
@@ -522,7 +528,7 @@ export class Ecosystem implements EcoContext {
 
   private async fastLoop(): Promise<void> {
     try {
-      if (!this.cfg.frozen?.enabled) this.enforceLlmEarnings();
+      if (!this.cfg.frozen?.enabled) await this.enforceLlmEarnings();
       await this.commander.tick();
       if (this.cfg.frozen?.enabled) return;
       this.strategist.tick();
@@ -533,28 +539,15 @@ export class Ecosystem implements EcoContext {
     }
   }
 
-  /**
-   * The LLM must earn its keep. If its attributed net P&L over the rolling
-   * window is below what it cost over the same window, pause it until a new
-   * season or a manual resume. This is the guardrail the user asked for: the
-   * model can never quietly cost more than it makes.
-   */
-  private enforceLlmEarnings(): void {
-    if (!this.cfg.llm.enabled || this.llmBudget.paused) return;
+  /** Direct authored realized P&L versus strategy-only estimated cost; news impact remains unmeasured. */
+  private async enforceLlmEarnings(): Promise<void> {
+    if (!this.cfg.llm.enabled || this.cfg.frozen?.enabled || this.llmBudget.paused || this.llmBudget.evaluationActive()) return;
     const windowDays = this.cfg.llm.earnWindowDays;
-    // Give it a grace period: judge only after a full window has elapsed.
-    if (Date.now() - this.seasonStartedAt < windowDays * 86_400_000) return;
-    const since = Date.now() - windowDays * 86_400_000;
-    let attributed = 0;
-    for (const [day, pnl] of Object.entries(this.llmAttribution.byDay)) {
-      if (Date.parse(day + 'T00:00:00Z') >= since) attributed += pnl;
-    }
-    // Approximate windowed cost by the daily budget times the window, capped at actual spend.
-    const windowedCost = Math.min(this.llmBudget.totalSpent(), this.cfg.llm.dailyBudgetUsd * windowDays);
-    if (attributed < windowedCost) {
-      this.llmBudget.paused = true;
-      this.llmPausedReason = `LLM-attributed P&L $${attributed.toFixed(2)} trailed its $${windowedCost.toFixed(2)} cost over ${windowDays}d`;
-      this.news('system', `Prof. Quill and the news desk are paused: ${this.llmPausedReason}. Resume them in the War Room if you want to keep paying.`, { good: false });
+    if (Date.now() - this.llmBudget.snapshot().accountingStartedAt < windowDays * 86_400_000) return;
+    const w = this.llmBudget.window(windowDays, this.llmAttribution.byDay);
+    if (w.directAuthoredPnl < w.strategyCost) {
+      this.llmBudget.pause('earnings', `Direct authored realized P&L $${w.directAuthoredPnl.toFixed(2)} trailed strategy estimated cost $${w.strategyCost.toFixed(2)} (${w.startDay} through ${w.endDay}, inclusive UTC days); news impact unmeasured`);
+      await this.llmBudget.persistPause();
     }
   }
 
@@ -808,6 +801,35 @@ export class Ecosystem implements EcoContext {
     return this.vault.all().filter((s) => s.live.trades >= 10 && s.live.pnl > 0).length;
   }
 
+  /** Independent fsynced ledger: ordinary season saves cannot overwrite paid-call authority. */
+  private async saveCost(snapshot: LlmCostState): Promise<void> {
+    await mkdir(this.cfg.dataDir, { recursive: true });
+    const file = path.join(this.cfg.dataDir, 'llm-cost.json');
+    const tmp = `${file}.${process.pid}.tmp`;
+    const handle = await open(tmp, 'w', 0o600);
+    try { await handle.writeFile(JSON.stringify(snapshot), 'utf8'); await handle.sync(); }
+    finally { await handle.close(); }
+    await rename(tmp, file);
+    const directory = await open(this.cfg.dataDir, 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  }
+
+  private async loadLlmCost(saved: SaveFile | null): Promise<void> {
+    try {
+      const raw = await readFile(path.join(this.cfg.dataDir, 'llm-cost.json'), 'utf8');
+      this.llmBudget.load(JSON.parse(raw));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.llmBudget.pause('accounting', 'Accounting review: unreadable LLM checkpoint');
+      } else if (saved) {
+        this.llmBudget.load(saved.llmCost);
+      } else {
+        try { await stat(this.stateFile); this.llmBudget.pause('accounting', 'Accounting review: existing season checkpoint lacks LLM history'); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.llmBudget.pause('accounting', 'Accounting review: season history unavailable'); }
+      }
+    }
+  }
+
   private llmCostDTO() {
     const snap = this.llmBudget.snapshot();
     const attributed = this.llmAttribution.total;
@@ -823,7 +845,21 @@ export class Ecosystem implements EcoContext {
       attributedPnl: attributed,
       netOfCost: attributed - snap.totalSpent,
       paused: this.llmBudget.paused,
-      pausedReason: this.llmBudget.paused ? this.llmPausedReason : null,
+      pausedReason: this.llmBudget.paused ? snap.pauseReason : null,
+      pausedAt: snap.pausedAt,
+      status: this.llm.readiness().state,
+      canResume: this.llm.enabled && this.llmBudget.canResume(),
+      grant: snap.grant ? { ...snap.grant, active: this.llmBudget.evaluationActive(),
+        remainingUsd: Math.max(0, snap.grant.maxAdditionalUsd - (snap.totalSpent - snap.grant.baselineSpent) - this.llmBudget.reserved()) } : null,
+      accountingBasis: 'configured-price estimated usage cost; not provider invoice',
+      accountingComplete: snap.accountingComplete,
+      reservedUsd: this.llmBudget.reserved(),
+      window: this.llmBudget.window(this.cfg.llm.earnWindowDays, this.llmAttribution.byDay),
+      seasonSpent: snap.totalSpent - snap.season.spentBaseline,
+      seasonAttributedPnl: attributed - snap.season.pnlBaseline,
+      attempts: snap.attempts, successes: snap.successes,
+      lastAttemptAt: snap.lastAttemptAt, lastSuccessAt: snap.lastSuccessAt, lastError: snap.lastError,
+      attributionScope: 'direct-authored-realized-only; descendants and news impact unmeasured',
     };
   }
 
@@ -885,6 +921,16 @@ export class Ecosystem implements EcoContext {
       frozenExperiment: this.frozenManifest ? { version: this.frozenManifest.version, fingerprint: this.frozenManifest.fingerprint,
         startedAt: this.frozenManifest.startedAt, endAt: this.frozenManifest.endAt, criteria: this.frozenManifest.criteria,
         expired: Date.now() >= this.frozenManifest.endAt, realDataForward: this.cfg.provider !== 'sim' && this.feed.provider.name !== 'sim' } : null,
+      allocationDiagnostics: this.commander.allocationDiagnostics(),
+      runtime: {
+        artifactFingerprint: this.artifactFingerprint,
+        identityStatus: this.artifactFingerprint ? 'measured' : 'unavailable',
+        nodeVersion: process.version,
+        venue: this.cfg.execution === 'paper' ? 'local' : this.cfg.execution,
+        configuredMoneyMode: this.cfg.execution === 'alpaca' ? (this.cfg.alpaca.paper ? 'paper' : 'live')
+          : this.cfg.execution === 'okx' ? (this.cfg.okx.demo ? 'paper' : 'live') : 'paper',
+        brokerVerified: false,
+      },
       setupWatchlist: setupWatchlist(this.cfg, this.feed),
       dsaResearch: this.dsaResearch.snapshot(),
       serverTime: Date.now(),
@@ -977,13 +1023,11 @@ export class Ecosystem implements EcoContext {
     this.commander.assignIdle();
   }
 
-  /** Manually wake the LLM agents after an earn-your-keep pause. */
-  resumeLlm(): void {
-    if (this.cfg.frozen?.enabled) return;
-    if (!this.llmBudget.paused) return;
-    this.llmBudget.paused = false;
-    this.llmPausedReason = null;
-    this.news('system', 'Prof. Quill and the news desk are back to work by your call.', { good: true });
+  /** Explicit POST-only evaluation: at most 60 minutes, $0.25, and remaining daily capacity. */
+  async resumeLlm() {
+    if (this.cfg.frozen?.enabled || !this.llm.enabled) throw new Error('LLM evaluation disabled');
+    await this.llmBudget.resumeEvaluation();
+    return this.llmCostDTO();
   }
 
   /** Start over with a fresh paper fund. The old season is backed up first. Agents keep their XP. */
@@ -1015,9 +1059,8 @@ export class Ecosystem implements EcoContext {
     this.equity = [];
     this.unlocked = {};
     this.totals = { genomesEvaluated: 0, strategiesDiscovered: 0, strategiesRetired: 0 };
-    this.llmAttribution = { byDay: {}, total: 0 };
-    this.llmBudget.paused = false;
-    this.llmPausedReason = null;
+    this.llmBudget.startSeason(this.llmAttribution.total);
+    await this.llmBudget.persistPause();
     this.seasonStartedAt = Date.now();
     this.lastEdition = { equity: this.fundEquity(), trades: 0, fees: 0 };
     if (this.riskOfficer.halted) this.riskOfficer.resume();

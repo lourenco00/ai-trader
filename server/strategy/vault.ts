@@ -2,6 +2,8 @@ import type { LiveStats, Metrics, StrategyDTO, StrategyStatus } from '../../shar
 import { describeGenome, genomeKey, type Genome } from './genome';
 
 export interface StrategyRecord {
+  opportunity?: StrategyDTO['opportunity'];
+  parked?: StrategyDTO['parked'];
   id: string;
   name: string;
   symbol: string;
@@ -73,6 +75,7 @@ export class StrategyVault {
     return this.all().find(
       (s) =>
         s.status !== 'retired' &&
+        !!s.trial === !!rec.trial &&
         s.symbol === rec.symbol &&
         s.genome.side === rec.genome.side &&
         Math.abs(s.train.trades - rec.train.trades) <= 2 &&
@@ -93,25 +96,32 @@ export class StrategyVault {
         this.keys.add(key);
         return false;
       }
+      // Replacing the same risk/qualification bucket cannot increase its size.
+      // Commit it atomically rather than delete first and fail a legacy quota later.
       this.items.delete(clone.id);
-    }
-    // Trials have their own small shelf so they never push proven strategies out.
-    if (rec.trial) {
-      const trials = this.byStatus('vault').filter((s) => s.trial);
-      if (trials.length >= 6) {
-        const worst = trials.reduce((a, b) => (a.fitness < b.fitness ? a : b));
-        if (worst.fitness >= rec.fitness) return false;
-        this.items.delete(worst.id);
-      }
       this.items.set(rec.id, rec);
       this.keys.add(key);
       return true;
     }
-    const waiting = this.byStatus('vault').filter((s) => !s.trial);
-    if (waiting.length >= this.capacity) {
-      const worst = waiting.reduce((a, b) => (a.fitness < b.fitness ? a : b));
+    // Full and trial records have separate shelves; fitness competes within
+    // symbol coverage before a new variant may displace a different market.
+    const waiting = this.byStatus('vault').filter((s) => !!s.trial === !!rec.trial);
+    const capacity = rec.trial ? 6 : this.capacity;
+    const sameRisk = waiting.filter(s => s.symbol === rec.symbol && s.genome.side === rec.genome.side);
+    const variantCap = rec.trial ? 1 : 2;
+    if (sameRisk.length >= variantCap) {
+      const worst = sameRisk.reduce((a,b) => a.fitness <= b.fitness ? a : b);
       if (worst.fitness >= rec.fitness) return false;
-      this.items.delete(worst.id); // evicted quietly: it never traded
+      this.items.delete(worst.id);
+    } else if (waiting.length >= capacity) {
+      const sameSymbol = waiting.filter(s => s.symbol === rec.symbol);
+      const counts = new Map<string, number>();
+      for (const s of waiting) counts.set(s.symbol, (counts.get(s.symbol) ?? 0) + 1);
+      const concentrated = waiting.filter(s => (counts.get(s.symbol) ?? 0) > 1);
+      const pool = sameSymbol.length ? sameSymbol : concentrated.length ? concentrated : waiting;
+      const worst = pool.reduce((a,b) => a.fitness <= b.fitness ? a : b);
+      if ((sameSymbol.length || !concentrated.length) && worst.fitness >= rec.fitness) return false;
+      this.items.delete(worst.id);
     }
     this.items.set(rec.id, rec);
     this.keys.add(key);
@@ -122,10 +132,10 @@ export class StrategyVault {
    * Best waiting strategy, preferring coins that are not crowded yet. No coin
    * gets more than `maxPerSymbol` traders, so one market can't dominate the floor.
    */
-  bestAvailable(activeSymbols: string[], maxPerSymbol: number, isOpen: (symbol: string) => boolean = () => true, allowTrial = true): StrategyRecord | undefined {
+  bestAvailable(activeSymbols: string[], maxPerSymbol: number, isOpen: (symbol: string) => boolean = () => true, allowTrial = true, eligible: (s: StrategyRecord) => boolean = s => !s.parked): StrategyRecord | undefined {
     const counts = new Map<string, number>();
     for (const s of activeSymbols) counts.set(s, (counts.get(s) ?? 0) + 1);
-    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol && isOpen(s.symbol) && (allowTrial || !s.trial));
+    const waiting = this.byStatus('vault').filter((s) => (counts.get(s.symbol) ?? 0) < maxPerSymbol && isOpen(s.symbol) && (allowTrial || !s.trial) && eligible(s));
     if (!waiting.length) return undefined;
     return waiting
       // Proven strategies always go first; a trial one only gets a trader when nothing better waits.
@@ -176,6 +186,8 @@ export class StrategyVault {
 
 export function toStrategyDTO(s: StrategyRecord): StrategyDTO {
   return {
+    ...(s.opportunity ? { opportunity: { ...s.opportunity } } : {}),
+    ...(s.parked ? { parked: { ...s.parked } } : {}),
     id: s.id,
     name: s.name,
     symbol: s.symbol,

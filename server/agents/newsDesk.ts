@@ -35,6 +35,7 @@ interface Tag {
 export class NewsDesk extends Agent {
   private nextRunAt = Date.now() + 20_000;
   private running = false;
+  private lastFailure: string | null = null;
   private seen = new Set<string>();
   private pending: Pending[] = [];
   headlinesRead = 0;
@@ -62,23 +63,23 @@ export class NewsDesk extends Agent {
 
   async tick(): Promise<void> {
     this.scorePending();
-    if (!this.ctx.cfg.news.enabled || this.running) return;
+    if (!this.ctx.cfg.news.enabled) return;
     const now = Date.now();
-    if (now < this.nextRunAt) return;
     if (!this.ctx.llm.affordable()) {
       this.mood = 'sleeping';
       this.activity = this.ctx.llm.affordableReason();
-      this.nextRunAt = now + 60_000;
       return;
     }
+    if (this.running || now < this.nextRunAt) return;
     this.running = true;
     this.activity = `Scanning the ${this.beat}...`;
     this.mood = 'neutral';
     try {
       await this.session();
-    } catch (err) {
-      log.warn(`${this.name} failed`, err);
-      this.lastHeadline = `News run failed: ${(err as Error).message.slice(0, 100)}`;
+    } catch {
+      log.warn(`${this.name} news classification failed (sanitized category)`);
+      this.lastFailure = 'News classification failed';
+      this.lastHeadline = 'News classification failed; batch remains unread';
       this.mood = 'sad';
     } finally {
       this.running = false;
@@ -89,16 +90,18 @@ export class NewsDesk extends Agent {
   private async session(): Promise<void> {
     const all = await fetchAllHeadlines(this.ctx.cfg.news.feeds);
     const fresh = all.filter((h) => !this.seen.has(key(h))).slice(0, this.ctx.cfg.news.maxHeadlinesPerCall);
-    for (const h of fresh) this.seen.add(key(h));
-    if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
     if (fresh.length === 0) {
       this.activity = 'No fresh headlines; waiting for the wire';
       return;
     }
-    this.headlinesRead += fresh.length;
     this.location = 'media';
-    this.addXp(fresh.length);
     const tags = await this.classify(fresh);
+    for (const h of fresh) this.seen.add(key(h));
+    if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
+    this.headlinesRead += fresh.length;
+    this.lastFailure = null;
+    this.markWork();
+    this.addXp(fresh.length);
     this.ctx.attributeLlm(this.id);
     let posted = 0;
     for (const t of tags) {
@@ -149,21 +152,21 @@ Return ONLY a JSON array. One object per headline that is clearly relevant to on
 - confidence: 0..1, your conviction this moves THAT asset. Be strict: most headlines are noise; use <0.45 or omit them.
 - horizonH: hours you expect the effect to last (1..72).
 Only use the exact asset tickers listed. No prose.`;
-    const res = await this.ctx.llm.complete(prompt, { fast: true, maxTokens: 700, temperature: 0.2 });
+    const res = await this.ctx.llm.complete(prompt, { fast: true, maxTokens: 700, temperature: 0.2, agentId: this.id, category: 'news' });
     return this.parse(res.text, headlines);
   }
 
   private parse(text: string, headlines: Headline[]): Tag[] {
     const start = text.indexOf('[');
     const end = text.lastIndexOf(']');
-    if (start < 0 || end <= start) return [];
+    if (start < 0 || end <= start) throw new Error('Invalid news classification');
     let raw: unknown;
     try {
       raw = JSON.parse(text.slice(start, end + 1));
     } catch {
-      return [];
+      throw new Error('Invalid news classification');
     }
-    if (!Array.isArray(raw)) return [];
+    if (!Array.isArray(raw)) throw new Error('Invalid news classification');
     const out: Tag[] = [];
     for (const item of raw) {
       if (!item || typeof item !== 'object') continue;
@@ -210,7 +213,10 @@ Only use the exact asset tickers listed. No prose.`;
   }
 
   toAnalystDTO(): AnalystDTO {
+    const readiness = this.ctx.llm.readiness(this.id, this.running, this.nextRunAt, this.ctx.cfg.news.enabled);
+    if (readiness.state === 'waiting' && this.lastFailure) { readiness.state = 'error'; readiness.reason = this.lastFailure; }
     return {
+      readiness,
       agentId: this.id,
       name: this.name,
       beat: this.beat,

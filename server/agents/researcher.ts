@@ -14,7 +14,7 @@ import {
 } from '../strategy/genome';
 import { emptyLive, type StrategyRecord } from '../strategy/vault';
 import { Rng, shortId } from '../util/rng';
-import { Agent } from './base';
+import { Agent, type AgentSave } from './base';
 import type { Dataset, EcoContext } from './context';
 
 interface Scored {
@@ -55,7 +55,7 @@ export function backtestOptions(ctx: EcoContext, symbol: string): BacktestOption
   return { feeRate: ctx.universe.feeRate(symbol), slippage: ctx.universe.slippage(symbol), barsPerYear: ctx.universe.barsPerYear(symbol) };
 }
 
-/** Full train + untouched holdout check. The holdout is the most recent 30% of history. */
+/** Configured recent holdout check; repeated selection is not untouched forward evidence. */
 export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation {
   const opts = backtestOptions(ctx, data.symbol);
   const p = ctx.universe.promotion(data.symbol);
@@ -138,6 +138,11 @@ export class Researcher extends Agent {
   private restUntil = 0;
   private bestEver: Scored | null = null;
   private epochSymbol: string | null = null;
+  /** Highest admitted completed-candle version per symbol; includes interrupted epochs. */
+  private datasetVersions = new Map<string, number>();
+  /** Migration baseline deferred until each existing market has usable history. */
+  private baselinePending = new Set<string>();
+  private workStatus: 'running' | 'resting' | 'waiting-data' = 'waiting-data';
 
   generation = 0;
   epoch = 0;
@@ -165,8 +170,18 @@ export class Researcher extends Agent {
 
   /** Cooperative slice of work; returns quickly so the event loop stays responsive. */
   work(budgetMs: number): void {
+    try {
+      this.workSlice(budgetMs);
+    } catch (error) {
+      this.cancelResearch();
+      throw error;
+    }
+  }
+
+  private workSlice(budgetMs: number): void {
     const now = Date.now();
     if (now < this.restUntil) {
+      this.workStatus = 'resting';
       this.location = 'hall';
       this.mood = 'neutral';
       this.activity = `Coffee break, back in ${Math.ceil((this.restUntil - now) / 1000)}s`;
@@ -175,6 +190,7 @@ export class Researcher extends Agent {
     if (!this.data && !this.beginEpoch()) return;
     const data = this.data;
     if (!data) return;
+    this.workStatus = 'running';
     this.location = 'lab';
     this.mood = 'happy';
 
@@ -187,28 +203,46 @@ export class Researcher extends Agent {
         continue;
       }
       this.generation++;
-      this.addXp(0.5);
       if (this.generation >= this.ctx.cfg.research.generationsPerEpoch) {
         this.finishEpoch(data);
         break;
       }
       this.breed();
     }
-    if (n) this.ctx.countEvaluated(n);
+    if (n) {
+      this.ctx.countEvaluated(n);
+      this.markWork();
+    }
+    if (!this.data) return; // finishEpoch owns the completed/resting status.
     const best = this.bestEver;
     this.activity = `Evolving ${this.symbol} gen ${this.generation + 1}/${this.ctx.cfg.research.generationsPerEpoch}` +
       (best ? `, best score ${best.fitness.toFixed(2)}` : '');
   }
 
   private beginEpoch(): boolean {
-    // Least recently researched first, so a newly explored market gets attention right away.
-    this.symbol = this.ctx.universe.pickForResearch(this.ctx.cfg.symbols, this.epoch + this.offset);
-    const data = this.ctx.dataset(this.symbol);
-    if (!data) {
-      this.ctx.universe.finishResearch(this.symbol);
-      this.activity = `Waiting for ${this.symbol} data`;
+    // Filter BEFORE picking/reserving: exhausted or unavailable symbols must not
+    // stall a different market with fresh history. dataset() uses existing cache only.
+    const eligible = new Map<string, Dataset>();
+    for (const symbol of this.ctx.cfg.symbols) {
+      const data = this.ctx.dataset(symbol);
+      if (!data || !Number.isFinite(data.lastT) || data.lastT <= 0) continue;
+      if (this.baselinePending.delete(symbol)) {
+        this.datasetVersions.set(symbol, Math.max(data.lastT, this.datasetVersions.get(symbol) ?? 0));
+        continue;
+      }
+      if (data.lastT > (this.datasetVersions.get(symbol) ?? 0)) eligible.set(symbol, data);
+    }
+    if (!eligible.size) {
+      this.workStatus = 'waiting-data';
+      this.location = 'hall';
+      this.mood = 'neutral';
+      this.activity = 'Waiting for new completed data';
       return false;
     }
+    this.symbol = this.ctx.universe.pickForResearch([...eligible.keys()], this.epoch + this.offset);
+    const data = eligible.get(this.symbol)!;
+    // Consume admission before work, so resets cannot replay partial generations.
+    this.datasetVersions.set(this.symbol, data.lastT);
     this.epochSymbol = this.symbol;
     this.data = data;
     this.generation = 0;
@@ -348,7 +382,12 @@ export class Researcher extends Agent {
       this.lastResult = `${label}: best candidate failed holdout${closest ? ` (${closest.why})` : ''}`;
     }
     this.epoch++;
-    if (this.epochSymbol) this.ctx.universe.finishResearch(this.epochSymbol);
+    // Activity credit once for a bounded fresh-data epoch, never per worker slice.
+    this.addXp(0.5 * this.ctx.cfg.research.generationsPerEpoch);
+    this.markWork();
+    this.workStatus = 'resting';
+    this.activity = `Completed ${data.symbol} gen ${this.generation}/${this.ctx.cfg.research.generationsPerEpoch}; resting`;
+    if (this.epochSymbol) this.ctx.universe.finishResearch(this.epochSymbol, data.lastT);
     this.epochSymbol = null;
     this.data = null;
     this.population = [];
@@ -358,6 +397,7 @@ export class Researcher extends Agent {
 
   toResearcherDTO(): ResearcherDTO {
     return {
+      workState: this.workStatus,
       agentId: this.id,
       name: this.name,
       specialty: SPECIALTY_LABEL[this.specialty],
@@ -378,6 +418,7 @@ export class Researcher extends Agent {
 
   stats(): Record<string, string | number> {
     return {
+      'Work status': this.workStatus,
       Specialty: SPECIALTY_LABEL[this.specialty],
       Symbol: this.symbol,
       Epoch: this.epoch,
@@ -388,21 +429,59 @@ export class Researcher extends Agent {
   }
 
   protected saveExtra(): unknown {
-    return { evaluated: this.evaluated, discoveries: this.discoveries, epoch: this.epoch, lastResult: this.lastResult };
+    return { evaluated: this.evaluated, discoveries: this.discoveries, epoch: this.epoch, lastResult: this.lastResult,
+      datasetVersions: Object.fromEntries(this.datasetVersions), baselinePending: [...this.baselinePending] };
+  }
+
+  override restore(saved: AgentSave): void {
+    this.cancelResearch();
+    super.restore({ ...saved, extra: saved.extra ?? {} });
   }
 
   protected restoreExtra(extra: unknown): void {
-    const e = extra as Partial<{ evaluated: number; discoveries: number; epoch: number; lastResult: string }>;
+    const e = (extra && typeof extra === 'object' ? extra : {}) as Partial<{ evaluated: number; discoveries: number; epoch: number; lastResult: string; datasetVersions: Record<string, unknown>; baselinePending: unknown }>;
+    this.datasetVersions.clear();
+    this.baselinePending = new Set(Array.isArray(e.baselinePending) ? e.baselinePending.filter((s): s is string => typeof s === 'string') : []);
+    if (e.datasetVersions && typeof e.datasetVersions === 'object' && !Array.isArray(e.datasetVersions)) {
+      for (const [symbol, version] of Object.entries(e.datasetVersions)) {
+        if (typeof version === 'number' && Number.isFinite(version) && version > 0) this.datasetVersions.set(symbol, version);
+        else this.baselinePending.add(symbol);
+      }
+    }
+    // Conservative restart boundary also covers a crash before the last checkpoint:
+    // consume the currently available history, then admit only a newer closed bar.
+    for (const symbol of this.ctx.cfg.symbols) {
+      const data = this.ctx.dataset(symbol);
+      if (data && Number.isFinite(data.lastT) && data.lastT > 0) {
+        this.datasetVersions.set(symbol, Math.max(data.lastT, this.datasetVersions.get(symbol) ?? 0));
+        this.baselinePending.delete(symbol);
+      } else {
+        this.baselinePending.add(symbol);
+      }
+    }
     this.evaluated = Number(e.evaluated) || 0;
     this.discoveries = Number(e.discoveries) || 0;
     this.epoch = Number(e.epoch) || 0;
     if (typeof e.lastResult === 'string') this.lastResult = e.lastResult;
   }
 
-  resetResearch(): void {
+  /** Release interrupted/shutdown work, retaining consumed versions and discoveries. */
+  cancelResearch(): void {
+    if (this.epochSymbol) this.ctx.universe.finishResearch(this.epochSymbol);
+    this.population = [];
+    this.scored = [];
+    this.bestEver = null;
+    this.generation = 0;
+    this.restUntil = 0;
+    this.workStatus = 'waiting-data';
+    this.activity = 'Waiting for new completed data';
     this.immigrants = [];
     this.data = null;
     this.epochSymbol = null;
+  }
+
+  resetResearch(): void {
+    this.cancelResearch();
     this.discoveries = 0;
   }
 }

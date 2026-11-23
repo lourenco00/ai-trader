@@ -46,6 +46,24 @@ const ENTRY_REASONS: readonly EntryDecisionReason[] = [
   'checkpoint-cancelled', 'submission-attempted', 'entry-filled', 'execution-unknown',
 ];
 
+/** The currently observed closed tradable bar; never backfill missed history. */
+export function observationBar(ctx: EcoContext, s: StrategyRecord): { t: number; timeframeMs: number } | null {
+  const tf = ctx.cfg.timeframeFor?.(s.symbol);
+  if (!Number.isSafeInteger(tf) || !(tf > 0) || !ctx.marketOpen(s.symbol)) return null;
+  const bars = ctx.feed.series(s.symbol);
+  if (bars.length < warmupBars(s.genome) + 2) return null;
+  const bar = bars[bars.length - 1];
+  if (!bar || !Number.isSafeInteger(bar.t) || bar.t < 0 || bar.t + tf > Date.now()
+    || ![bar.o,bar.h,bar.l,bar.c].every(x => Number.isFinite(x) && x > 0)) return null;
+  if (ctx.cfg.assetClass?.(s.symbol) === 'stock') {
+    const parts = new Intl.DateTimeFormat('en-US', {timeZone:'America/New_York',weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(bar.t);
+    const part = (key: string) => parts.find(p => p.type === key)?.value;
+    const minute = Number(part('hour')) * 60 + Number(part('minute'));
+    if (['Sat','Sun'].includes(part('weekday') ?? '') || minute < 570 || minute + tf / 60_000 > 960) return null;
+  }
+  return {t:bar.t,timeframeMs:tf};
+}
+
 export class Trader extends Agent {
   wallet: Wallet = { cash: 0, units: 0, position: null };
   strategy: StrategyRecord | null = null;
@@ -61,6 +79,7 @@ export class Trader extends Agent {
   retiringReason: string | null = null;
   private queue: Promise<void> = Promise.resolve();
   private lastBlockedBar = 0;
+  private lastCompletedWorkBar = -1;
   private entryDecisions: EntryDiagnostics = { counts: {}, lastReason: null, lastAt: null };
   private lastSizing?: EntryDiagnostics['lastSizing'];
 
@@ -147,10 +166,19 @@ export class Trader extends Agent {
   }
 
   assign(s: StrategyRecord): void {
+    this.markWork();
+    this.lastCompletedWorkBar = -1;
     this.strategy = s;
     this.assignedAt = Date.now();
     this.navAtAssign = this.nav();
     this.peakNav = 1;
+    if (s.parked) {
+      // Requeue is not forgiveness: retain the original loss/drawdown baseline.
+      this.navAtAssign = this.nav() / s.parked.navSinceAssign;
+      this.peakNav = s.parked.peakNav;
+      if (s.opportunity) s.opportunity.count = 0;
+      delete s.parked;
+    }
     this.activity = `Studying ${s.name} (${s.symbol})`;
     this.mood = 'happy';
   }
@@ -193,6 +221,7 @@ export class Trader extends Agent {
     const strat = compile(cache, g);
     const i = window.length - 1;
     const bar = window[i];
+    this.observeOpportunity(s, bar.t);
     const atr = strat.atr[i];
     const price = this.ctx.feed.price(symbol) ?? bar.c;
     const p = this.wallet.position;
@@ -219,6 +248,20 @@ export class Trader extends Agent {
     }
     if (!(atr > 0)) { this.noteEntry('invalid-atr'); return; }
     await this.open(s, price, atr, bar.t);
+  }
+
+  private observeOpportunity(s: StrategyRecord, barT: number): void {
+    const observed = observationBar(this.ctx, s);
+    if (!observed || observed.t !== barT) return;
+    if (barT > this.lastCompletedWorkBar) { this.markWork(); this.lastCompletedWorkBar = barT; }
+    if (this.ctx.cfg.frozen?.enabled || this.wallet.position || this.orderPending || this.executionIntent || this.exitOnly || this.retiringReason) return;
+    const prev = s.opportunity;
+    if (!prev || prev.timeframeMs !== observed.timeframeMs || prev.lastTradeAt !== s.live.lastTradeAt) {
+      s.opportunity = {baselineBar:barT,lastBar:barT,count:0,timeframeMs:observed.timeframeMs,lastTradeAt:s.live.lastTradeAt};
+    } else if (barT - prev.lastBar >= observed.timeframeMs) {
+      prev.count = Math.min(Number.MAX_SAFE_INTEGER, prev.count + 1);
+      prev.lastBar = barT;
+    }
   }
 
   private async open(s: StrategyRecord, price: number, atr: number, barT: number): Promise<void> {
@@ -339,6 +382,7 @@ export class Trader extends Agent {
     };
     await this.completeExecution();
     this.noteEntry('entry-filled');
+    this.markWork();
     this.addXp(5);
     this.mood = 'excited';
     this.activity = `Opened ${g.side.toUpperCase()} ${s.symbol} @ ${fmtPrice(fill.price)}`;
@@ -453,6 +497,7 @@ export class Trader extends Agent {
     this.activity = `Closed ${p.symbol} ${reason}: ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}`;
     this.ctx.recordTrade(trade);
     await this.completeExecution();
+    this.markWork();
     this.ctx.emit({
       kind: 'trade_close',
       agentId: this.id,

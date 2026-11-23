@@ -4,6 +4,7 @@ import { Agent } from './base';
 import type { EcoContext } from './context';
 import { pct, validate } from './researcher';
 import type { Trader } from './trader';
+import { observationBar } from './trader';
 
 export interface Treasury {
   reserve: number;
@@ -90,19 +91,21 @@ export class Commander extends Agent {
       // A trader given a strategy for a shut market would just stand idle; crypto never closes.
       // Only a few traders at a time run trial strategies, so unproven ideas stay a small part of the fund.
       const trialsActive = this.traders.filter((x) => x.strategy?.trial).length;
-      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol, (sym) => this.ctx.marketOpen(sym), trialsActive < this.ctx.cfg.research.maxTrialTraders);
+      const s = this.ctx.vault.bestAvailable(activeSymbols, maxPerSymbol, (sym) => this.ctx.marketOpen(sym), trialsActive < this.ctx.cfg.research.maxTrialTraders, (s) => this.parkedReady(s));
       if (!s) return;
       this.ctx.vault.assign(s.id, t.id);
       t.assign(s);
+      const carriedReturn = t.navSinceAssign();
       const target = this.ctx.fund.equity() * this.baseFraction() * (s.trial ? this.ctx.cfg.research.trialSizeFactor : 0.5); // probation size, smaller on trial
       const amount = Math.min(target, this.treasury.reserve - this.minReserve());
       if (amount > 0) {
         this.treasury.reserve -= amount;
         t.deposit(amount);
         // Reset NAV baseline after the first deposit so returns start at zero.
-        t.navAtAssign = t.nav();
+        t.navAtAssign = t.nav() / carriedReturn;
       }
       this.hires++;
+      this.markWork();
       this.addXp(10);
       this.ctx.news('allocation', `${this.name} handed "${s.name}" (${s.symbol}) to ${t.name} with $${amount.toFixed(0)} on probation`, { agentId: this.id });
       this.ctx.emit({ kind: 'assign', agentId: t.id, text: `New strategy: ${s.name}`, building: 'vault' });
@@ -121,15 +124,21 @@ export class Commander extends Agent {
     for (const t of this.traders) {
       const cur = t.strategy;
       if (!cur || t.wallet.position || t.orderPending || t.exitOnly || t.retiringReason || t.executionIntent || cur.live.trades > 0) continue;
+      if (!this.ctx.marketOpen(cur.symbol) || this.traders.some((x) => x !== t && x.strategy?.symbol === cur.symbol)) continue;
       const better = waiting
-        .filter((s) => s.symbol === cur.symbol && s.fitness > cur.fitness + 0.5)
+        .filter((s) => s.symbol === cur.symbol && s.fitness > cur.fitness + 0.5 && (!s.trial || cur.trial === true))
+        .filter((s) => this.parkedReady(s))
+        .filter((s) => !s.trial || (this.traders.filter((x) => x !== t && x.strategy?.trial).length < this.ctx.cfg.research.maxTrialTraders
+          && t.equity() <= this.ctx.fund.equity() * this.baseFraction() * this.ctx.cfg.research.trialSizeFactor))
         .sort((a, b) => b.fitness - a.fitness)[0];
       if (!better) continue;
       this.ctx.vault.shelve(cur.id);
       this.ctx.vault.assign(better.id, t.id);
       const nav = t.navAtAssign;
+      const incomingWasParked = !!better.parked;
       t.assign(better);
-      t.navAtAssign = nav;
+      // assign restores a parked strategy's own return and peak NAV history.
+      if (!incomingWasParked) t.navAtAssign = nav;
       this.addXp(5);
       this.ctx.news('allocation', `${this.name} swapped ${t.name}'s untested "${cur.name}" for the stronger "${better.name}" (${better.symbol})`, { agentId: this.id });
       this.ctx.emit({ kind: 'assign', agentId: t.id, text: `Upgrade: ${better.name}`, building: 'vault' });
@@ -203,15 +212,36 @@ export class Commander extends Agent {
         this.ctx.news('allocation', `"${s.name}" (${s.symbol}) passed its trial live: profit factor ${(live.grossWin / live.grossLoss).toFixed(2)} over ${live.trades} trades. Full status`, { agentId: this.id, good: true });
       }
       const pf = live.grossLoss > 0 ? live.grossWin / live.grossLoss : live.grossWin > 0 ? 99 : 0;
-      const idleMs = Date.now() - (live.lastTradeAt ?? t.assignedAt);
+
       let reason: string | null = null;
       if (t.drawdownSinceAssign() > maxDd) reason = `drawdown ${pct(-t.drawdownSinceAssign())} breached the ${pct(-maxDd)} limit`;
       else if (live.trades >= r.minTradesForJudgement && t.navSinceAssign() < r.navFloor) reason = `lost ${pct(t.navSinceAssign() - 1)} on probation`;
       else if (live.trades >= 15 && pf < r.minProfitFactorAfter15) reason = `profit factor ${pf.toFixed(2)} after ${live.trades} trades`;
       else if (s.trial && live.trades >= 8 && pf < 1) reason = `trial failed: profit factor ${pf.toFixed(2)} after ${live.trades} trades`;
-      else if (!t.wallet.position && idleMs > r.idleDays * 86_400_000) reason = `no trades for ${r.idleDays} days`;
       if (reason) await this.retire(t, reason);
+      else if (!this.ctx.cfg.frozen?.enabled && !t.wallet.position && !t.executionIntent && !t.exitOnly && s.opportunity
+        && s.opportunity.lastTradeAt === live.lastTradeAt && s.opportunity.count >= this.observationTarget(s)) {
+        const reason = `quiet after ${s.opportunity.count} observed tradable bar opportunities; parked until new completed data`;
+        s.parked = {at:Date.now(),reason,afterBar:s.opportunity.lastBar,navSinceAssign:t.navSinceAssign(),peakNav:t.peakNav};
+        this.ctx.vault.shelve(s.id);
+        this.treasury.reserve += t.withdraw(t.wallet.cash);
+        t.unassign();
+        t.activity = `Parked ${s.name}: ${reason}`;
+        this.ctx.news('allocation', `${this.name} parked "${s.name}" (${s.symbol}): ${reason}`, {agentId:this.id});
+      }
     }
+  }
+
+  private observationTarget(s: StrategyRecord): number {
+    const tf = this.ctx.cfg.timeframeFor(s.symbol);
+    const sessionMs = this.ctx.cfg.assetClass(s.symbol) === 'stock' ? 390 * 60_000 : 86_400_000;
+    return Number.isSafeInteger(tf) && tf > 0 ? Math.max(1, Math.ceil(this.ctx.cfg.retirement.idleDays * sessionMs / tf)) : Infinity;
+  }
+
+  private parkedReady(s: StrategyRecord): boolean {
+    if (!s.parked) return true;
+    const observed = observationBar(this.ctx,s);
+    return !!observed && observed.t - s.parked.afterBar >= observed.timeframeMs;
   }
 
   async retire(t: Trader, reason: string): Promise<void> {
@@ -255,6 +285,23 @@ export class Commander extends Agent {
     if (dropped.length) {
       this.ctx.news('allocation', `${this.name} archived ${dropped.length} stale strateg${dropped.length === 1 ? 'y' : 'ies'} that failed re-testing on fresh data`, { agentId: this.id });
     }
+  }
+
+  /** Observational only: one primary blocker per waiting record, never an allocation. */
+  allocationDiagnostics() {
+    const waiting = this.ctx.vault.byStatus('vault');
+    const owned = new Set(this.traders.flatMap(t => t.strategy ? [t.strategy.symbol] : []));
+    const trialCap = this.traders.filter(t => t.strategy?.trial).length >= this.ctx.cfg.research.maxTrialTraders;
+    const blocked = {'parked':0,'market-closed':0,'symbol-owned':0,'trial-cap':0,'frozen':0,'halted':0};
+    let eligible = 0;
+    for (const s of waiting) {
+      const reason = !this.parkedReady(s) ? 'parked' : !this.ctx.marketOpen(s.symbol) ? 'market-closed'
+        : owned.has(s.symbol) ? 'symbol-owned' : s.trial && trialCap ? 'trial-cap'
+        : this.ctx.cfg.frozen?.enabled ? 'frozen' : this.ctx.risk.halted ? 'halted' : null;
+      if (reason) blocked[reason]++; else eligible++;
+    }
+    return {waiting:waiting.length,eligible,blocked,
+      parked:waiting.filter(s => s.parked).map(s => ({strategyId:s.id,symbol:s.symbol,...s.parked!,ready:this.parkedReady(s)}))};
   }
 
   stats(): Record<string, string | number> {

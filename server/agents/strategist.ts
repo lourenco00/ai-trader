@@ -8,6 +8,12 @@ import { makeRecord, pct, validate } from './researcher';
 
 const log = logger('strategist');
 
+function safeFailure(err: unknown): string {
+  const message = err instanceof Error ? err.message : '';
+  return ['LLM provider-rejected', 'LLM ambiguous-billing', 'LLM accounting persistence failed', 'LLM spending authorization unavailable'].includes(message)
+    ? message : 'session error';
+}
+
 interface Proposal {
   symbol: string;
   genome: Genome;
@@ -22,6 +28,7 @@ interface Proposal {
 export class Strategist extends Agent {
   private nextRunAt = Date.now() + 60_000;
   private running = false;
+  private lastFailure: string | null = null;
   sessions = 0;
   proposed = 0;
   discoveries = 0;
@@ -42,16 +49,15 @@ export class Strategist extends Agent {
   }
 
   tick(): void {
-    if (!this.ctx.cfg.llm.enabled || this.running) return;
     const now = Date.now();
-    if (now < this.nextRunAt) {
-      this.activity = `Pondering. Next brainstorm in ${Math.ceil((this.nextRunAt - now) / 60_000)} min`;
-      return;
-    }
     if (!this.ctx.llm.affordable()) {
       this.mood = 'sleeping';
       this.activity = this.ctx.llm.affordableReason();
-      this.nextRunAt = now + 60_000;
+      return;
+    }
+    if (this.running) return;
+    if (now < this.nextRunAt) {
+      this.activity = `Pondering. Next brainstorm in ${Math.ceil((this.nextRunAt - now) / 60_000)} min`;
       return;
     }
     this.running = true;
@@ -59,8 +65,9 @@ export class Strategist extends Agent {
     this.mood = 'excited';
     void this.session()
       .catch((err) => {
-        log.warn('LLM session failed', err);
-        this.lastResult = `LLM call failed: ${(err as Error).message.slice(0, 120)}`;
+        log.warn('LLM session failed (sanitized category)');
+        this.lastFailure = 'Strategy session failed';
+        this.lastResult = `LLM call failed: ${safeFailure(err)}`;
         this.mood = 'sad';
       })
       .finally(() => {
@@ -71,8 +78,10 @@ export class Strategist extends Agent {
 
   private async session(): Promise<void> {
     const prompt = this.buildPrompt();
-    const res = await this.ctx.llm.complete(prompt, { maxTokens: 3000, temperature: 0.9 });
+    const res = await this.ctx.llm.complete(prompt, { maxTokens: 3000, temperature: 0.9, agentId: this.id, category: 'strategy' });
     this.ctx.attributeLlm(this.id);
+    this.lastFailure = null;
+    this.markWork();
     const ideas = parseProposals(res.text, this.ctx.cfg.symbols);
     this.sessions++;
     this.proposed += ideas.length;
@@ -161,7 +170,10 @@ Make the 5 ideas diverse (different symbols, sides and indicator families).`;
   }
 
   toResearcherDTO(): ResearcherDTO {
+    const readiness = this.ctx.llm.readiness(this.id, this.running, this.nextRunAt);
+    if (readiness.state === 'waiting' && this.lastFailure) { readiness.state = 'error'; readiness.reason = this.lastFailure; }
     return {
+      readiness,
       agentId: this.id,
       name: this.name,
       specialty: 'LLM Brainstorming',

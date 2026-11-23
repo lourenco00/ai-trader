@@ -15,8 +15,9 @@ export interface ExploredEntry {
 interface Stats {
   /** Latest 24h dollar volume, refreshed on every scan. */
   volumeUsd: number | null;
-  /** Research epochs completed on this symbol since it joined. */
+  /** Distinct completed dataset periods researched since this symbol joined. */
   epochs: number;
+  lastResearchT: number;
   /** Epochs started and not yet finished, so parallel researchers spread out. */
   inProgress: number;
   lastPicked: number;
@@ -26,6 +27,7 @@ export interface UniverseSave {
   explored: ExploredEntry[];
   volumes: Record<string, number>;
   epochs: Record<string, number>;
+  researchCoverage?: Record<string, { lastT: number; periods: number }>;
 }
 
 export type UniverseListener = (change: { added?: string; removed?: string }) => void;
@@ -63,7 +65,7 @@ export class Universe {
   private stat(symbol: string): Stats {
     let s = this.stats.get(symbol);
     if (!s) {
-      s = { volumeUsd: null, epochs: 0, inProgress: 0, lastPicked: 0 };
+      s = { volumeUsd: null, epochs: 0, lastResearchT: 0, inProgress: 0, lastPicked: 0 };
       this.stats.set(symbol, s);
     }
     return s;
@@ -96,12 +98,14 @@ export class Universe {
     if (this.cfg.isCore(e.symbol) || this.explored.has(e.symbol)) return false;
     this.cfg.registerSymbol({ symbol: e.symbol, asset: e.asset } satisfies SymbolSpec);
     this.explored.set(e.symbol, e);
-    this.stats.set(e.symbol, { ...this.stat(e.symbol), epochs: 0, inProgress: 0, lastPicked: 0 });
+    // restoreFacts may already carry validated coverage for a rehydrated symbol.
+    this.stat(e.symbol);
     this.emit({ added: e.symbol });
     return true;
   }
 
   remove(symbol: string): boolean {
+    if (this.researchInProgress(symbol) > 0) return false;
     if (!this.explored.delete(symbol)) return false;
     this.cfg.unregisterSymbol(symbol);
     this.stats.delete(symbol);
@@ -233,11 +237,19 @@ export class Universe {
     return best;
   }
 
-  finishResearch(symbol: string): void {
+  /** Release an epoch; only versioned completions count towards eviction coverage. */
+  finishResearch(symbol: string, lastT?: number): void {
     const s = this.stats.get(symbol);
-    if (!s) return;
-    s.inProgress = Math.max(0, s.inProgress - 1);
-    s.epochs++;
+    if (!s || s.inProgress <= 0) return;
+    s.inProgress--;
+    if (typeof lastT === 'number' && Number.isFinite(lastT) && lastT > 0 && lastT > s.lastResearchT) {
+      s.lastResearchT = lastT;
+      s.epochs++;
+    }
+  }
+
+  researchInProgress(symbol: string): number {
+    return this.stats.get(symbol)?.inProgress ?? 0;
   }
 
   epochs(symbol: string): number {
@@ -249,18 +261,28 @@ export class Universe {
   save(): UniverseSave {
     const volumes: Record<string, number> = {};
     const epochs: Record<string, number> = {};
+    const researchCoverage: NonNullable<UniverseSave['researchCoverage']> = {};
     for (const [sym, s] of this.stats) {
       if (s.volumeUsd !== null) volumes[sym] = s.volumeUsd;
       epochs[sym] = s.epochs;
+      if (s.lastResearchT > 0) researchCoverage[sym] = { lastT: s.lastResearchT, periods: s.epochs };
     }
-    return { explored: this.exploredEntries(), volumes, epochs };
+    return { explored: this.exploredEntries(), volumes, epochs, researchCoverage };
   }
 
   /** Restores facts only. Membership is re-established by `rehydrate` once the feed has data. */
   restoreFacts(saved: Partial<UniverseSave> | undefined): ExploredEntry[] {
     if (!saved) return [];
     for (const [sym, v] of Object.entries(saved.volumes ?? {})) this.setVolume(sym, Number(v));
-    for (const [sym, n] of Object.entries(saved.epochs ?? {})) this.stat(sym).epochs = Number(n) || 0;
+    // Legacy epochs were replayed computation, not independent period coverage.
+    for (const s of this.stats.values()) { s.epochs = 0; s.lastResearchT = 0; }
+    for (const [sym, coverage] of Object.entries(saved.researchCoverage ?? {})) {
+      if (!coverage || !Number.isFinite(coverage.lastT) || coverage.lastT <= 0 ||
+          !Number.isSafeInteger(coverage.periods) || coverage.periods <= 0) continue;
+      const s = this.stat(sym);
+      s.epochs = coverage.periods;
+      s.lastResearchT = coverage.lastT;
+    }
     return (saved.explored ?? []).filter((e) => e && typeof e.symbol === 'string' && (e.asset === 'crypto' || e.asset === 'stock'));
   }
 

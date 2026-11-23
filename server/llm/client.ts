@@ -1,115 +1,87 @@
 import type { Config } from '../config';
-import { logger } from '../util/log';
+import type { LlmBudget, LlmScope } from './budget';
 
-const log = logger('llm');
+export interface LlmUsage { inputTokens: number; outputTokens: number; costUsd: number }
+export interface LlmResult { text: string; usage: LlmUsage }
+export type Budget = LlmBudget;
+export type LlmReadinessState = 'disabled' | 'paused-earnings' | 'paused-budget' | 'paused-accounting' | 'waiting' | 'running' | 'error';
 
-export interface LlmUsage {
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-}
-
-export interface LlmResult {
-  text: string;
-  usage: LlmUsage;
-}
-
-export type Budget = {
-  /** Returns true and reserves nothing if the call is allowed; the caller reports actual spend after. */
-  canSpend(): boolean;
-  record(usage: LlmUsage): void;
-  spentToday(): number;
-  dailyBudget: number;
-  paused: boolean;
-};
-
-/**
- * One place for every LLM call. It meters tokens, converts them to a dollar
- * estimate from the configured per-token prices, and refuses to call when the
- * day's budget is already spent. Both the strategist and the news desk go
- * through here so the cost ledger is complete.
- */
+/** Configured-price estimates, never a provider invoice or provider hard cap. */
 export class LlmClient {
-  constructor(
-    private cfg: Config,
-    private budget: Budget,
-  ) {}
-
-  get enabled(): boolean {
-    return this.cfg.llm.enabled;
+  constructor(private cfg: Config, private budget: Budget) {}
+  get enabled(): boolean { return this.cfg.llm.enabled && !this.cfg.frozen?.enabled; }
+  affordable(): boolean { return this.enabled && this.budget.canSpend(); }
+  readiness(agentId?: string, running = false, nextRunAt: number | null = null, configured = true) {
+    const s = this.budget.snapshot();
+    const a = agentId ? s.agents[agentId] : s;
+    let state: LlmReadinessState = 'waiting';
+    if (!this.enabled || !configured) state = 'disabled';
+    else if (s.pauseKind === 'accounting') state = 'paused-accounting';
+    else if (this.budget.paused) state = 'paused-earnings';
+    else if (!this.budget.canSpend()) state = 'paused-budget';
+    else if (running) state = 'running';
+    else if (a?.lastError) state = 'error';
+    const reason = state === 'disabled' ? 'LLM work disabled by configuration' : state.startsWith('paused') ? this.affordableReason() :
+      state === 'error' ? `LLM ${a?.lastError}` : state === 'running' ? 'LLM request in progress' : 'Waiting for schedule or input';
+    return { state, reason, lastAttemptAt: a?.lastAttemptAt ?? null, lastSuccessAt: a?.lastSuccessAt ?? null, nextRunAt,
+      attempts: a?.attempts ?? 0, successes: a?.successes ?? 0, lastError: a?.lastError ?? null };
   }
-
-  affordable(): boolean {
-    return this.cfg.llm.enabled && this.budget.canSpend();
-  }
-
   affordableReason(): string {
-    if (!this.cfg.llm.enabled) return 'Asleep (no LLM key configured)';
-    if (this.budget.paused) return 'Asleep: not earning its keep (resume in the War Room)';
-    if (this.cfg.llm.dailyBudgetUsd > 0 && this.budget.spentToday() >= this.cfg.llm.dailyBudgetUsd) {
-      return `Daily LLM budget spent ($${this.budget.spentToday().toFixed(2)}/$${this.cfg.llm.dailyBudgetUsd.toFixed(2)})`;
-    }
-    return 'Resting';
+    const s = this.budget.snapshot();
+    if (!this.enabled) return 'LLM work disabled by configuration';
+    if (this.budget.paused) return s.pauseReason ?? 'LLM paused';
+    if (!this.budget.canSpend()) return 'Daily LLM budget unavailable (zero means no spend)';
+    return 'Waiting for schedule or input';
   }
-
-  private price(usage: { inputTokens: number; outputTokens: number }): number {
-    return (
-      (usage.inputTokens / 1_000_000) * this.cfg.llm.priceInPerMTok +
-      (usage.outputTokens / 1_000_000) * this.cfg.llm.priceOutPerMTok
-    );
+  private price(inputTokens: number, outputTokens: number): number {
+    return (inputTokens * this.cfg.llm.priceInPerMTok + outputTokens * this.cfg.llm.priceOutPerMTok) / 1_000_000;
   }
-
-  /**
-   * @param fast use the cheaper model (news tagging). Falls back to the main model.
-   */
-  async complete(prompt: string, opts: { fast?: boolean; maxTokens?: number; temperature?: number } = {}): Promise<LlmResult> {
-    if (!this.cfg.llm.enabled) throw new Error('LLM is not configured');
-    if (!this.budget.canSpend()) {
-      throw new Error(`daily LLM budget of $${this.cfg.llm.dailyBudgetUsd.toFixed(2)} is spent ($${this.budget.spentToday().toFixed(4)} used)`);
-    }
-    const model = opts.fast ? this.cfg.llm.fastModel : this.cfg.llm.model;
+  async complete(prompt: string, opts: { fast?: boolean; maxTokens?: number; temperature?: number; agentId?: string; category?: LlmScope } = {}): Promise<LlmResult> {
+    if (!this.enabled) throw new Error('LLM work disabled');
     const maxTokens = opts.maxTokens ?? 3000;
-    const { provider, apiKey, baseUrl } = this.cfg.llm;
-    const signal = AbortSignal.timeout(90_000);
-    let text = '';
-    let usage: LlmUsage;
-
-    if (provider === 'anthropic') {
-      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/messages`, {
-        method: 'POST',
-        signal,
-        headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        // Current Claude models reject `temperature`, so Anthropic calls leave sampling at the model default.
-        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
-      });
-      if (!res.ok) throw new Error(`anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const body = (await res.json()) as { content?: { type: string; text?: string }[]; usage?: { input_tokens?: number; output_tokens?: number } };
-      text = (body.content ?? []).map((c) => c.text ?? '').join('');
-      const input = body.usage?.input_tokens ?? estimateTokens(prompt);
-      const output = body.usage?.output_tokens ?? estimateTokens(text);
-      usage = { inputTokens: input, outputTokens: output, costUsd: this.price({ inputTokens: input, outputTokens: output }) };
-    } else {
-      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
-        method: 'POST',
-        signal,
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, temperature: opts.temperature ?? 0.7, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
-      });
-      if (!res.ok) throw new Error(`openai-compatible HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const body = (await res.json()) as { choices?: { message?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number } };
-      text = body.choices?.[0]?.message?.content ?? '';
-      const input = body.usage?.prompt_tokens ?? estimateTokens(prompt);
-      const output = body.usage?.completion_tokens ?? estimateTokens(text);
-      usage = { inputTokens: input, outputTokens: output, costUsd: this.price({ inputTokens: input, outputTokens: output }) };
+    const prices = [this.cfg.llm.priceInPerMTok, this.cfg.llm.priceOutPerMTok];
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 100_000 || prices.some(p => !Number.isFinite(p) || p < 0) || !prices.some(p => p > 0)) {
+      throw new Error('LLM configured pricing or output bound invalid');
     }
-
-    this.budget.record(usage);
-    log.debug(`call: ${usage.inputTokens}+${usage.outputTokens} tok, $${usage.costUsd.toFixed(5)} (today $${this.budget.spentToday().toFixed(4)}/${this.budget.dailyBudget})`);
-    return { text, usage };
+    // UTF-8 bytes upper-bound prompt tokens, plus framing allowance. This is not a provider billing guarantee.
+    const bound = this.price(Buffer.byteLength(prompt, 'utf8') + 32, maxTokens);
+    const model = opts.fast ? this.cfg.llm.fastModel : this.cfg.llm.model;
+    const { provider, apiKey, baseUrl } = this.cfg.llm;
+    const anthropic = provider === 'anthropic';
+    const url = `${baseUrl.replace(/\/$/, '')}${anthropic ? '/v1/messages' : '/chat/completions'}`;
+    const init: RequestInit = {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(90_000),
+      headers: anthropic ? { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } :
+        { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, max_tokens: maxTokens, ...(anthropic ? {} : { temperature: opts.temperature ?? 0.7 }), messages: [{ role: 'user', content: prompt }] }),
+    };
+    const r = await this.budget.reserve(bound, opts.category, opts.agentId);
+    if (!this.enabled || !this.budget.authorize(r)) {
+      await this.budget.release(r);
+      throw new Error('LLM authorization changed before submission');
+    }
+    this.budget.attempted(r);
+    let rejected = false;
+    let settled = false;
+    try {
+      const res = await fetch(url, init);
+      if (!res.ok) {
+        // No provider body is read, persisted or logged.
+        rejected = res.status >= 400 && res.status < 500 && res.status !== 408;
+        throw new Error(rejected ? 'LLM provider-rejected' : 'LLM ambiguous-billing');
+      }
+      const body: any = await res.json();
+      const text = anthropic ? (body.content ?? []).map((c: any) => c.text ?? '').join('') : body.choices?.[0]?.message?.content;
+      const input = anthropic ? body.usage?.input_tokens : body.usage?.prompt_tokens;
+      const output = anthropic ? body.usage?.output_tokens : body.usage?.completion_tokens;
+      if (typeof text !== 'string' || ![input, output].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('LLM ambiguous-billing');
+      const usage = { inputTokens: input, outputTokens: output, costUsd: this.price(input, output) };
+      settled = true;
+      await this.budget.settle(r, usage);
+      return { text, usage };
+    } catch {
+      if (!settled) await this.budget.failed(r, rejected);
+      throw new Error(settled ? 'LLM accounting persistence failed' : rejected ? 'LLM provider-rejected' : 'LLM ambiguous-billing');
+    }
   }
-}
-
-/** Rough fallback when the API omits usage: ~4 chars per token. */
-function estimateTokens(s: string): number {
-  return Math.ceil(s.length / 4);
 }

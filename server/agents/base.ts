@@ -6,6 +6,22 @@ export function xpForLevel(level: number): number {
   return Math.round(100 * Math.max(0, level - 1) ** 1.6);
 }
 
+/** Exact threshold search; bounded even for the largest supported historical XP. */
+function levelForXp(xp: number): number {
+  let lo = 1;
+  let hi = Math.ceil((Number.MAX_SAFE_INTEGER / 100) ** (1 / 1.6)) + 2;
+  while (lo + 1 < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (xpForLevel(mid) <= xp) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function validXp(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, value)) : 0;
+}
+
 export interface AgentSave {
   id: string;
   xp: number;
@@ -16,7 +32,20 @@ export interface AgentSave {
 export abstract class Agent {
   xp = 0;
   level = 1;
-  activity = 'Waking up';
+  private _activity = 'Waking up';
+  activityAt: number | null = null;
+  lastWorkAt: number | null = null;
+
+  get activity(): string { return this._activity; }
+  set activity(value: string) {
+    if (value !== this._activity) {
+      this._activity = value;
+      this.activityAt = Date.now();
+    }
+  }
+
+  /** Genuine work heartbeat, independent of prose changes and activity XP. */
+  markWork(): void { this.lastWorkAt = Date.now(); }
   mood: Mood = 'neutral';
   location: BuildingId;
 
@@ -33,10 +62,12 @@ export abstract class Agent {
   }
 
   addXp(amount: number): void {
-    if (!(amount > 0)) return;
-    this.xp += amount;
-    while (this.xp >= xpForLevel(this.level + 1)) {
-      this.level++;
+    if (!Number.isFinite(amount) || !(amount > 0)) return;
+    this.xp = validXp(this.xp + Math.min(amount, Number.MAX_SAFE_INTEGER));
+    const nextLevel = levelForXp(this.xp);
+    if (nextLevel > this.level) {
+      // One notification per reward, not millions of replayed historical milestones.
+      this.level = nextLevel;
       this.ctx.levelUp(this);
     }
   }
@@ -48,8 +79,8 @@ export abstract class Agent {
   }
 
   restore(s: AgentSave): void {
-    this.xp = Math.max(0, Number(s.xp) || 0);
-    this.level = Math.max(1, Math.floor(Number(s.level) || 1));
+    this.xp = validXp(s.xp);
+    this.level = levelForXp(this.xp);
     if (s.extra !== undefined) this.restoreExtra(s.extra);
   }
 
@@ -74,6 +105,8 @@ export abstract class Agent {
       xpForLevel: cur,
       xpToNext: next,
       activity: this.activity,
+      activityAt: this.activityAt,
+      lastWorkAt: this.lastWorkAt,
       mood: this.mood,
       appearance: this.appearance,
       stats: this.stats(),

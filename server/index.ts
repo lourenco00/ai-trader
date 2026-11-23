@@ -107,9 +107,10 @@ async function main(): Promise<void> {
           case '/api/resume':
             eco.resume();
             return sendJson(res, 200, { ok: true });
-          case '/api/resume-llm':
-            eco.resumeLlm();
-            return sendJson(res, 200, { ok: true });
+          case '/api/resume-llm': {
+            const llmCost = await eco.resumeLlm();
+            return sendJson(res, llmCost.paused ? 409 : 200, { ok: !llmCost.paused, llmCost });
+          }
           case '/api/new-season': {
             const backup = await eco.newSeason();
             return sendJson(res, 200, { ok: true, backup: backup ? path.basename(backup) : null });

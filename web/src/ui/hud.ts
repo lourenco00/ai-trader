@@ -2,6 +2,7 @@ import type { WorldSnapshot } from '../../../shared/types';
 import { BUILDINGS } from '../world/map';
 import { character } from '../world/sprites';
 import { ago, cls, esc, money, pct } from './format';
+import { agentReadiness } from './readiness';
 
 const ROLE_ORDER: Record<string, number> = { commander: 0, risk: 1, treasurer: 2, scout: 3, explorer: 3, reporter: 4, analyst: 5, strategist: 6, researcher: 7, trader: 8 };
 
@@ -9,15 +10,18 @@ export function renderHud(el: HTMLElement, s: WorldSnapshot): void {
   const f = s.fund;
   const day = Math.floor((s.serverTime - s.seasonStartedAt) / 86_400_000) + 1;
   const passed = s.graduation.filter((c) => c.passed).length;
+  const executionLabel = s.execution === 'local' ? 'SIMULATED FILLS'
+    : `${s.execution.toUpperCase()} ${s.runtime?.configuredMoneyMode === 'live' ? 'LIVE (configured)'
+      : s.runtime?.configuredMoneyMode === 'paper' ? (s.execution === 'okx' ? 'DEMO (configured)' : 'PAPER (configured)') : 'MODE UNVERIFIED'}`;
   const data = s.risk.dataStale
     ? '<span class="badge stale">DATA STALE</span>'
     : s.provider === 'sim'
       ? '<span class="badge sim">SIMULATED DATA</span>'
       : `<span class="muted">${esc(s.provider)} · live</span>`;
   el.innerHTML = `
-    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">${s.execution === 'alpaca' ? 'ALPACA PAPER' : s.execution === 'okx' ? 'OKX DEMO' : 'SIMULATED FILLS'}</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
+    <div class="title box"><span class="coin" aria-hidden="true"></span>AI TRADER VALLEY <span class="badge">${esc(executionLabel)}</span>${s.risk.halted ? '<span class="badge halt">HALTED</span>' : ''}</div>
     <div class="chip box"><span class="k">Fund</span><span class="v">${money(f.equity)} <small class="${cls(f.totalReturn)}">${pct(f.totalReturn)}</small></span></div>
-    ${s.broker ? `<div class="chip box" title="The real Alpaca paper account. Ledger vs Alpaca: ${(s.broker.gap * 100).toFixed(2)}%"><span class="k">Alpaca</span><span class="v">${money(s.broker.equity)}</span></div>` : ''}
+    ${s.broker ? `<div class="chip box" title="App-cached broker reading, not independently verified. Ledger gap: ${(s.broker.gap * 100).toFixed(2)}%"><span class="k">Alpaca</span><span class="v">${money(s.broker.equity)}</span></div>` : ''}
     <div class="chip box"><span class="k">Today</span><span class="v ${cls(f.pnlToday)}">${money(f.pnlToday, true)}</span></div>
     <div class="chip box"><span class="k">Drawdown</span><span class="v">${pct(f.drawdown, 1, false)}</span></div>
     <div class="chip box"><span class="k">Open</span><span class="v">${f.openPositions}</span></div>
@@ -33,7 +37,7 @@ export function renderHotbar(el: HTMLElement, s: WorldSnapshot | null): void {
       case 'markets':
         return `${s.fund.openPositions} open`;
       case 'lab':
-        return `${s.researchers.filter((r) => r.enabled).length} busy`;
+        return `${s.researchers.filter((r) => r.enabled).length} enabled`;
       case 'vault':
         return `${s.strategies.length} strats`;
       case 'graveyard':
@@ -74,12 +78,13 @@ export function renderRoster(el: HTMLElement, s: WorldSnapshot, collapsed: boole
   el.innerHTML = `<h2>VILLAGERS (${agents.length}) <button data-action="toggle-roster" aria-expanded="${!collapsed}">${collapsed ? 'show' : 'hide'}</button></h2>
     ${agents
       .map((a) => {
-        const p = a.xpToNext > a.xpForLevel ? (a.xp - a.xpForLevel) / (a.xpToNext - a.xpForLevel) : 1;
-        return `<button class="agent" data-action="open-agent" data-id="${esc(a.id)}">
+        const p = a.xpToNext > a.xpForLevel ? Math.max(0, Math.min(1, (a.xp - a.xpForLevel) / (a.xpToNext - a.xpForLevel))) : 1;
+        const readiness = agentReadiness(a, s);
+        return `<button class="agent" data-action="open-agent" data-id="${esc(a.id)}" title="Last reported: ${esc(a.activity)}">
           <img src="${portraitUrl(a)}" width="32" height="54" alt="" style="image-rendering:pixelated">
-          <span><span class="name">${esc(a.name)} <span class="muted">Lv ${a.level}</span></span>
+          <span><span class="name">${esc(a.name)} <span class="muted">Activity Lv ${a.level}</span></span>
           <div class="xpbar"><i style="width:${(p * 100).toFixed(0)}%"></i></div>
-          <span class="act">${esc(a.activity)}</span></span>
+          <span class="act">${esc(readiness.state)}: ${esc(readiness.reason)}</span></span>
         </button>`;
       })
       .join('')}`;

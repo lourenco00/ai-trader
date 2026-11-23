@@ -46,6 +46,10 @@ export interface AgentDTO {
   xpForLevel: number;
   xpToNext: number;
   activity: string;
+  /** Last status text change, not a successful-work heartbeat. */
+  activityAt?: number | null;
+  /** Last explicitly recorded genuine work; null until observed this process. */
+  lastWorkAt?: number | null;
   mood: Mood;
   appearance: Appearance;
   stats: Record<string, string | number>;
@@ -86,6 +90,8 @@ export interface LiveStats {
 export type StrategyStatus = 'vault' | 'active' | 'retired';
 
 export interface StrategyDTO {
+  opportunity?: { baselineBar: number; lastBar: number; count: number; timeframeMs: number; lastTradeAt: number | null };
+  parked?: { at: number; reason: string; afterBar: number; navSinceAssign: number; peakNav: number };
   id: string;
   name: string;
   symbol: string;
@@ -187,7 +193,20 @@ export interface TraderDTO {
   entryDiagnostics?: EntryDiagnostics;
 }
 
+export interface LlmReadiness {
+  state: 'disabled' | 'paused-earnings' | 'paused-budget' | 'paused-accounting' | 'waiting' | 'running' | 'error';
+  reason: string;
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  nextRunAt: number | null;
+  attempts?: number;
+  successes?: number;
+  lastError?: 'provider-rejected' | 'ambiguous-billing' | 'persistence' | null;
+}
+
 export interface ResearcherDTO {
+  workState?: 'running' | 'resting' | 'waiting-data';
+  readiness?: LlmReadiness;
   agentId: string;
   name: string;
   specialty: string;
@@ -242,6 +261,7 @@ export interface SignalDTO {
 }
 
 export interface AnalystDTO {
+  readiness?: LlmReadiness;
   agentId: string;
   name: string;
   beat: string;
@@ -254,6 +274,22 @@ export interface AnalystDTO {
 }
 
 export interface LlmCostDTO {
+  status?: LlmReadiness['state'];
+  canResume?: boolean;
+  pausedAt?: number | null;
+  grant?: { startedAt: number; expiresAt: number; day: string; maxAdditionalUsd: number; baselineSpent: number; remainingUsd: number; active: boolean } | null;
+  accountingBasis?: string;
+  accountingComplete?: boolean;
+  reservedUsd?: number;
+  window?: { startDay: string; endDay: string; days: number; policy: 'inclusive-utc-calendar-days'; strategyCost: number; newsCost: number; otherCost: number; directAuthoredPnl: number };
+  seasonSpent?: number;
+  seasonAttributedPnl?: number;
+  attempts?: number;
+  successes?: number;
+  lastAttemptAt?: number | null;
+  lastSuccessAt?: number | null;
+  lastError?: 'provider-rejected' | 'ambiguous-billing' | 'persistence' | null;
+  attributionScope?: string;
   enabled: boolean;
   model: string;
   fastModel: string;
@@ -390,6 +426,20 @@ export interface SetupWatchRow {
 }
 
 export interface WorldSnapshot {
+  allocationDiagnostics?: {
+    waiting: number;
+    eligible: number;
+    blocked: Record<'parked' | 'market-closed' | 'symbol-owned' | 'trial-cap' | 'frozen' | 'halted', number>;
+    parked: (NonNullable<StrategyDTO['parked']> & {strategyId:string;symbol:string;ready:boolean})[];
+  };
+  runtime?: {
+    artifactFingerprint: string | null;
+    identityStatus: 'measured' | 'unavailable';
+    nodeVersion: string;
+    venue: 'local' | 'alpaca' | 'okx';
+    configuredMoneyMode: 'paper' | 'live';
+    brokerVerified: false;
+  };
   setupWatchlist?: SetupWatchlistSnapshot;
   frozenExperiment?: {
     version: 1;
