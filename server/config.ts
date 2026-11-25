@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { HI_INTRADAY_ID, HI_INTRADAY_FUND_NAME } from './profiles/hi-intraday';
 import { dsaSettings } from './research/dsa';
 import { checkLiveApproval, type LiveApproval, type LiveVenue } from './live';
 
@@ -121,6 +122,8 @@ if (setupWatchlistRaw !== undefined && setupWatchlistRaw !== 'true' && setupWatc
 }
 
 export const config = {
+  intraday: env.HI_INTRADAY_EXPERIMENT === HI_INTRADAY_ID,
+  fundName: env.HI_INTRADAY_EXPERIMENT === HI_INTRADAY_ID ? HI_INTRADAY_FUND_NAME : undefined,
   setupWatchlistEnabled: setupWatchlistRaw === 'true',
   frozen: {
     enabled: bool('FROZEN_FORWARD_ENABLED', false),

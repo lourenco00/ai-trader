@@ -16,6 +16,7 @@ import { emptyLive, type StrategyRecord } from '../strategy/vault';
 import { Rng, shortId } from '../util/rng';
 import { Agent, type AgentSave } from './base';
 import type { Dataset, EcoContext } from './context';
+import { conformsIntraday, projectIntraday } from '../profiles/hi-intraday';
 
 interface Scored {
   genome: Genome;
@@ -66,6 +67,7 @@ export function validate(ctx: EcoContext, data: Dataset, g: Genome): Validation 
   const early = backtest(data.cache, g, data.trainEnd, mid, opts).metrics;
   const late = backtest(data.cache, g, mid, data.cache.length, opts).metrics;
   const fails: string[] = [];
+  if (!conformsIntraday(ctx.cfg, data.symbol, g)) fails.push('intraday hold policy: symbol or maximum bars outside experiment bounds');
   if (g.side === 'short' && !ctx.universe.shortable(data.symbol)) fails.push(`${data.symbol} cannot be shorted`);
   if (train.trades < p.minTrainTrades) fails.push(`train trades ${train.trades}<${p.minTrainTrades}`);
   if (train.sharpe < p.minTrainSharpe) fails.push(`train Sharpe ${train.sharpe.toFixed(2)}`);
@@ -261,8 +263,8 @@ export class Researcher extends Agent {
     for (const s of mine) seeds.push(mutate(this.rng, s.genome, this.specialty, 0.6));
     seeds.push(...this.immigrants.splice(0));
     while (seeds.length < size) seeds.push(randomGenome(this.rng, this.specialty));
-    this.population = dedupe(seeds).slice(0, size);
-    while (this.population.length < size) this.population.push(randomGenome(this.rng, this.specialty));
+    this.population = dedupe(seeds.map(g => projectIntraday(this.ctx.cfg, this.symbol, g))).slice(0, size);
+    while (this.population.length < size) this.population.push(projectIntraday(this.ctx.cfg, this.symbol, randomGenome(this.rng, this.specialty)));
     return true;
   }
 
@@ -307,7 +309,7 @@ export class Researcher extends Agent {
     const size = this.ctx.cfg.research.populationSize;
     const ranked = [...this.scored].sort((x, y) => y.fitness - x.fitness);
     const next: Genome[] = ranked.slice(0, 3).map((s) => s.genome);
-    next.push(...this.immigrants.splice(0, 3));
+    next.push(...this.immigrants.splice(0, 3).map(g => projectIntraday(this.ctx.cfg, this.symbol, g)));
     const keys = new Set(next.map(genomeKey));
     let guard = 0;
     while (next.length < size && guard++ < size * 10) {
@@ -319,12 +321,13 @@ export class Researcher extends Agent {
         child = this.rng.chance(0.6) ? crossover(this.rng, p1, this.tournament()) : p1;
         if (this.rng.chance(0.9)) child = mutate(this.rng, child, this.specialty);
       }
+      child = projectIntraday(this.ctx.cfg, this.symbol, child);
       const key = genomeKey(child);
       if (keys.has(key)) continue;
       keys.add(key);
       next.push(child);
     }
-    while (next.length < size) next.push(randomGenome(this.rng, this.specialty));
+    while (next.length < size) next.push(projectIntraday(this.ctx.cfg, this.symbol, randomGenome(this.rng, this.specialty)));
     this.population = next;
     this.scored = [];
   }

@@ -433,6 +433,7 @@ export interface WorldSnapshot {
     parked: (NonNullable<StrategyDTO['parked']> & {strategyId:string;symbol:string;ready:boolean})[];
   };
   runtime?: {
+    experiment?: 'hi-intraday-v1';
     artifactFingerprint: string | null;
     identityStatus: 'measured' | 'unavailable';
     nodeVersion: string;

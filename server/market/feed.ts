@@ -182,8 +182,9 @@ export class MarketFeed {
       const tf = this.cfg.timeframeFor(symbol);
       const raw = await p.fetchHistory(symbol, tf, this.cfg.historyBars + 1);
       const closed = raw.filter((c) => c.t + tf <= now);
-      if (closed.length < MIN_HISTORY) {
-        throw new Error(`${symbol}: only ${closed.length} candles of history, need at least ${MIN_HISTORY}`);
+      const minimum = this.cfg.intraday ? 1500 : MIN_HISTORY;
+      if (closed.length < minimum) {
+        throw new Error(`${symbol}: only ${closed.length} candles of history, need at least ${minimum}`);
       }
       this.candles.set(symbol, closed);
       this.prices.set(symbol, raw[raw.length - 1].c);

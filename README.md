@@ -75,7 +75,7 @@ Small caps are treated more harshly than BTC, on purpose: slippage rises as 24h 
 
 ## The high-activity profile
 
-`npm run hi` starts a separate local simulated $100,000 fund (http://localhost:8789), with 24 traders, 8 researchers, up to 90% research CPU, short stock / hourly crypto candles and broader notional allowances. It retains the same 0.1% trade stop-risk cap, 0.25% symbol stop-risk cap, one symbol owner, 1% manual-review daily loss pause and forward-evidence sizing gate. Extra traders may remain idle rather than duplicate symbol exposure. Fills are local simulations against market data, not Alpaca account orders. Compare using `DATA_DIR=./data-hi npm run report`.
+`npm run hi` selects a **separate local-paper short-hold experiment**, not a more leveraged version of Main. It uses shorter execution bars, a fixed liquid research universe and a profile-specific holding policy applied consistently to generated and validated strategies. It preserves validation/cost gates, exclusive symbol ownership, risk limits and forward-evidence sizing; idle traders are preferable to forced trades. The new experiment uses `data-hi-intraday`, leaving legacy `data-hi` untouched. It neither submits Alpaca/OKX orders nor enables paid models. The Treasury activity card distinguishes measured exit-record frequency (including partial exits), recent-sample coverage and entry telemetry; none is a trade quota. See [High-Activity experiment, evidence limits and rollout checks](docs/hi-intraday.md). A bounded bar holding period does **not** guarantee flat positions overnight.
 
 ## Real money, and the server
 

@@ -8,6 +8,7 @@ import { shortId } from '../util/rng';
 import { Agent } from './base';
 import type { EcoContext } from './context';
 import { NotSubmittedError } from '../broker/broker';
+import { conformsIntraday } from '../profiles/hi-intraday';
 
 const log = logger('trader');
 
@@ -166,6 +167,7 @@ export class Trader extends Agent {
   }
 
   assign(s: StrategyRecord): void {
+    if (!conformsIntraday(this.ctx.cfg, s.symbol, s.genome)) throw new Error('intraday assignment refuses nonconforming approved genome');
     this.markWork();
     this.lastCompletedWorkBar = -1;
     this.strategy = s;

@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { HI_INTRADAY_ID } from './profiles/hi-intraday';
+import { IntradayVault, prepareIntradayDirectory, validateIntradayConfig } from './profiles/hi-intraday-state';
 import { mkdir, open, readFile, rename, stat } from 'node:fs/promises';
 import { freeze, hasFrozenEnrollment, sourceIdentity, validateFrozenConfig, type FrozenManifest } from './validation/frozen';
 import { ShadowResearch } from './research/dsa';
@@ -69,6 +71,7 @@ interface SaveFile {
   version: 1;
   executionMode?: Config['execution'];
   frozenFingerprint?: string;
+  intradayIdentity?: string;
   savedAt: number;
   seasonStartedAt: number;
   fund: FundState;
@@ -169,6 +172,7 @@ export class Ecosystem implements EcoContext {
   private artifactFingerprint: string | null = null;
 
   constructor(readonly cfg: Config) {
+    validateIntradayConfig(cfg);
     validateFrozenConfig(cfg);
     if (cfg.frozen?.enabled && (cfg.execution !== 'paper' || cfg.live.enabled || cfg.live.approval || cfg.live.venue)) {
       throw new Error('frozen experiments require local paper execution, never an active venue');
@@ -193,7 +197,7 @@ export class Ecosystem implements EcoContext {
       this.broker = new GuardedBroker(this.broker, { maxOrderUsd: cfg.live.approval.maxOrderUsd, maxOrdersPerHour: cfg.live.maxOrdersPerHour });
       log.warn(`LIVE MONEY on ${cfg.live.venue}: cap $${cfg.live.approval.capUsd}, max order $${cfg.live.approval.maxOrderUsd}, stop at -${(cfg.live.approval.maxLossPct * 100).toFixed(0)}%, approval ends ${new Date(cfg.live.approval.expiresAt).toISOString().slice(0, 10)}`);
     }
-    this.vault = new StrategyVault(cfg.research.vaultCapacity);
+    this.vault = cfg.intraday ? new IntradayVault(cfg) : new StrategyVault(cfg.research.vaultCapacity);
     // Real money never starts with more than the approved cap.
     this.capital = cfg.live.approval ? Math.min(cfg.startingCapital, cfg.live.approval.capUsd) : cfg.startingCapital;
     this.fundState = freshFund(this.capital);
@@ -235,9 +239,11 @@ export class Ecosystem implements EcoContext {
   // -------------------------------------------------------------------------
 
   async start(): Promise<void> {
+    await prepareIntradayDirectory(this.cfg);
     // Measured source/runtime bytes, not a Git deployment claim or a broker attestation.
     this.artifactFingerprint = await sourceIdentity().catch(() => null);
     const saved = await readJson<SaveFile>(this.stateFile);
+    if (!this.cfg.intraday && saved?.intradayIdentity) throw new Error('intraday checkpoint cannot activate as an ordinary fund');
     await this.loadLlmCost(saved);
     if (!this.cfg.frozen?.enabled && (saved?.frozenFingerprint || await hasFrozenEnrollment(this.cfg.dataDir))) {
       throw new Error('frozen experiment directory cannot activate as a normal fund');
@@ -923,6 +929,7 @@ export class Ecosystem implements EcoContext {
         expired: Date.now() >= this.frozenManifest.endAt, realDataForward: this.cfg.provider !== 'sim' && this.feed.provider.name !== 'sim' } : null,
       allocationDiagnostics: this.commander.allocationDiagnostics(),
       runtime: {
+        ...(this.cfg.intraday ? { experiment: 'hi-intraday-v1' as const } : {}),
         artifactFingerprint: this.artifactFingerprint,
         identityStatus: this.artifactFingerprint ? 'measured' : 'unavailable',
         nodeVersion: process.version,
@@ -1093,6 +1100,7 @@ export class Ecosystem implements EcoContext {
         version: 1,
         executionMode: this.cfg.execution,
         frozenFingerprint: this.frozenManifest?.fingerprint,
+        intradayIdentity: this.cfg.intraday ? HI_INTRADAY_ID : undefined,
         savedAt: Date.now(),
         seasonStartedAt: this.seasonStartedAt,
         fund: this.fundState,

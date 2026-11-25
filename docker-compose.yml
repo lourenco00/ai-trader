@@ -31,12 +31,12 @@ services:
     ports: ["127.0.0.1:8788:8788"]
     volumes: ["./data-niche:/app/data-niche"]
 
-  # The high-activity paper profile (simulated $100,000).
+  # High-Activity short-hold paper experiment; legacy ./data-hi remains untouched.
   hi:
     <<: *app
     command: ["npx", "tsx", "server/hiact.ts"]
     ports: ["127.0.0.1:8789:8789"]
-    volumes: ["./data-hi:/app/data-hi"]
+    volumes: ["./data-hi-intraday:/app/data-hi-intraday"]
 
   # Small-cap crypto research (hourly candles, simulated fills on Binance prices, OKX-level fees).
   small:

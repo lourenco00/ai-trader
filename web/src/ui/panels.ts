@@ -3,6 +3,7 @@ import { BUILDING_BY_ID } from '../world/map';
 import { drawEquity, drawSpark } from './charts';
 import { ago, cls, dateTime, esc, money, pct, price } from './format';
 import { agentReadiness, llmReadiness } from './readiness';
+import { activityPanel } from './activity';
 
 export interface PanelView {
   title: string;
@@ -269,7 +270,7 @@ function bank(s: WorldSnapshot): PanelView {
     .join('');
   return {
     title: 'TREASURY',
-    sub: `Penny keeps the books. Starting capital ${money(f.startingCapital)} of paper money. The full trade log is in data/trades.jsonl.`,
+    sub: `Penny keeps the books. Starting capital ${money(f.startingCapital)} of paper money. The full trade log is in ${s.runtime?.experiment === 'hi-intraday-v1' ? 'data-hi-intraday' : 'data'}/trades.jsonl.`,
     html: `
       <div class="grid">
         ${stat('Equity', money(f.equity))}
@@ -279,6 +280,7 @@ function bank(s: WorldSnapshot): PanelView {
         ${stat('Win rate', f.trades ? pct(f.winRate, 0, false) : '-')}
         ${stat('Profit factor', f.trades ? f.profitFactor.toFixed(2) : '-')}
       </div>
+      ${activityPanel(s)}
       <h3>Equity curve</h3>
       <canvas class="chart" id="eq-chart" aria-label="Fund equity over time"></canvas>
       <h3>Ledger (latest ${s.trades.length})</h3>
